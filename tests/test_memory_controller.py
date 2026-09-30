@@ -1,4 +1,4 @@
-"""Memory controller: autoscale batch/context/activations to the 2 GB cap."""
+"""Memory controller: autoscale batch/context/activations to the 5 GB cap."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ from training.memory_controller import (
 
 
 class MemoryControllerTests(unittest.TestCase):
-    def test_budget_is_hardcoded_2gb(self):
-        self.assertEqual(process_budget_bytes(), 2 * 1024 ** 3)
+    def test_budget_is_hardcoded_5gb(self):
+        self.assertEqual(process_budget_bytes(), 5 * 1024 ** 3)
         self.assertEqual(process_budget_bytes(), PROCESS_BUDGET_BYTES)
         self.assertLess(usable_bytes(0.15), process_budget_bytes())
 
@@ -48,7 +48,7 @@ class MemoryControllerTests(unittest.TestCase):
         self.assertEqual(plan.actions, [])
         self.assertLess(plan.estimated_bytes, usable_bytes())
 
-    def test_l32_autoscales_under_2gb(self):
+    def test_l32_batch8_fits_with_eval_per_layer(self):
         plan = plan_train(
             n_params=25_362_847,
             batch_size=8,
@@ -63,7 +63,7 @@ class MemoryControllerTests(unittest.TestCase):
         self.assertTrue(plan.fits, msg=plan.summary_line())
         self.assertLessEqual(plan.estimated_bytes, plan.usable_bytes)
         self.assertTrue(plan.eval_per_layer)
-        self.assertTrue(plan.gradient_checkpointing)
+        self.assertFalse(plan.gradient_checkpointing)
         self.assertEqual(plan.requested_batch, 8)
         self.assertLessEqual(plan.batch_size, 8)
         self.assertEqual(plan.batch_size * plan.grad_accum, 8 * 2)
@@ -100,7 +100,7 @@ class MemoryControllerTests(unittest.TestCase):
                 n_params=400_000_000,
                 autoscale=True,
             )
-        self.assertIn("2 GB", str(ctx.exception))
+        self.assertIn("5 GB", str(ctx.exception))
 
     def test_generate_caps_new_tokens_to_context(self):
         plan = plan_generate(
@@ -157,7 +157,7 @@ class MemoryControllerTests(unittest.TestCase):
         common = dict(
             n_params=25_362_847,
             batch_size=4,
-            max_len=256,
+            max_len=512,
             embedding_dim=256,
             num_heads=16,
             num_layers=32,
@@ -172,10 +172,10 @@ class MemoryControllerTests(unittest.TestCase):
 
     def test_autoscale_streams_before_shrinking_t(self):
         common = dict(
-            n_params=25_362_847,
+            n_params=80_000_000,
             batch_size=4,
-            max_len=2048,
-            embedding_dim=256,
+            max_len=2560,
+            embedding_dim=512,
             num_heads=16,
             num_layers=32,
             vocab_size=4112,
@@ -190,14 +190,14 @@ class MemoryControllerTests(unittest.TestCase):
         plan_no = plan_train(**common, allow_stream=False)
         self.assertTrue(plan_no.fits, msg=plan_no.summary_line())
         self.assertEqual(plan_no.layer_strategy, "resident")
-        self.assertLess(plan_no.max_len, 2048)
+        self.assertLess(plan_no.max_len, 2560)
         self.assertGreaterEqual(plan.max_len, plan_no.max_len)
 
     def test_no_layer_stream_refuses_to_enable(self):
         plan = plan_train(
             n_params=25_362_847,
             batch_size=4,
-            max_len=256,
+            max_len=512,
             embedding_dim=256,
             num_heads=16,
             num_layers=32,

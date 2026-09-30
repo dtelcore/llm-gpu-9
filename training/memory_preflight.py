@@ -1,4 +1,4 @@
-"""Refuse train recipes that cannot fit the 2 GB process budget.
+"""Refuse train recipes that cannot fit the process budget.
 
 MLX ``set_memory_limit`` can lag; a 25M / 32-layer step already peaked at ~5 GB
 on the 8 GB Air before ``check_memory`` ran. Estimate resident + VJP cache
@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Mapping, Optional
 
 from logging_config import logger
-from model.cuda.env import PROCESS_BUDGET_BYTES, MemoryBudgetError
+from model.cuda.env import PROCESS_BUDGET_BYTES, MemoryBudgetError, process_budget_label
 from training.memory_controller import estimate_train_bytes
 
 
@@ -81,7 +81,7 @@ def assert_train_fits_budget(
     where: str = "train preflight",
     extra: Optional[Mapping[str, object]] = None,
 ) -> int:
-    """Raise MemoryBudgetError if the estimated step cannot fit in 2 GB."""
+    """Raise MemoryBudgetError if the estimated step cannot fit the process budget."""
     estimated = estimate_train_step_bytes(
         n_params=n_params,
         batch_size=batch_size,
@@ -105,13 +105,13 @@ def assert_train_fits_budget(
         hint = (
             "Disable --no-autoscale so the memory controller can shrink batch/context "
             "and enable checkpointing. Architecture C/L/H is never changed. "
-            "If weights+Adam alone exceed 2 GB, this recipe cannot run."
+            f"If weights+Adam alone exceed {process_budget_label()}, this recipe cannot run."
         )
         extras = ""
         if extra:
             extras = " " + " ".join(f"{k}={v}" for k, v in extra.items())
         raise MemoryBudgetError(
-            f"process unified memory estimated over 2 GB budget ({where}): "
+            f"process unified memory estimated over {process_budget_label()} budget ({where}): "
             f"estimate={est_mb:.0f} MB budget={budget_mb:.0f} MB "
             f"params={n_params:,} C={embedding_dim} L={num_layers} H={num_heads} "
             f"T={max_len} batch={batch_size} accum={grad_accum} "

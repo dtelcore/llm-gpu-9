@@ -1,0 +1,47 @@
+{
+  "model": {
+    "name": "Story C=128 L=4 T=128",
+    "vocab_size": null,
+    "max_len": 128,
+    "embedding_dim": 128,
+    "num_heads": 8,
+    "num_layers": 4,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "description": "Story C=128 L=4 T=128. H=8, residual_scale=off, layers=resident. 2 GB process cap is hardcoded.",
+    "residual_scale": false,
+    "layer_strategy": "resident"
+  },
+  "dataset": {
+    "name": "tinystories_packed_valid",
+    "combine": false,
+    "path": "data/tinystories_packed/text/valid.txt",
+    "tokenizer": "bpe",
+    "bpe_merges": 200,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "Story C=128 L=4 T=128",
+    "learning_rate": 0.0005,
+    "weight_decay": 0.01,
+    "batch_size": 4,
+    "num_epochs": 1,
+    "warmup_steps": 500,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 2,
+    "window_stride": 64,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08
+  },
+  "metadata": {
+    "created": "story-c128-l4-t128",
+    "description": "Smoke recipe. Reads data/tinystories_packed/text/valid.txt (stories wrapped with start and end tokens). The four train shards stay out of this 200-step run."
+  }
+}

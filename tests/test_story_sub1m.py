@@ -51,6 +51,31 @@ class CombinedDirectoryTests(unittest.TestCase):
             )
             self.assertEqual(loader.current_dataset, COMBINED_DATASET_NAME)
 
+    def test_menu_discovers_nested_txt_and_keeps_stem_collisions_distinct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            (data_dir / "only.txt").write_text("top level\n", encoding="utf-8")
+            packed = data_dir / "tinystories_packed" / "text"
+            plain = data_dir / "tinystories" / "text"
+            packed.mkdir(parents=True)
+            plain.mkdir(parents=True)
+            (packed / "valid.txt").write_text("<|startofstory|> packed\n", encoding="utf-8")
+            (plain / "valid.txt").write_text("plain\n", encoding="utf-8")
+            (data_dir / "tinystories" / "parquet").mkdir()
+            (data_dir / "tinystories" / "parquet" / "train.parquet").write_bytes(b"not text")
+
+            loader = DatasetLoader(data_dir=str(data_dir), auto_discover=True)
+            names = set(loader._discovered)
+            self.assertIn("only", names)
+            self.assertIn("tinystories_packed/text/valid", names)
+            self.assertIn("tinystories/text/valid", names)
+            self.assertFalse(any(name.endswith("parquet") or "parquet" in name for name in names))
+
+            listed = loader.list_datasets()
+            self.assertEqual(listed[COMBINED_DATASET_NAME]["file_count"], 1)
+            corpus = loader.get_corpus("tinystories_packed/text/valid")
+            self.assertEqual(corpus, ["<|startofstory|> packed"])
+
     def test_load_by_reserved_name_combines_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

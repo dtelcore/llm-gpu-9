@@ -13,6 +13,25 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 from logging_config import logger
 
+START_OF_STORY = "<|startofstory|>"
+END_OF_STORY = "<|endofstory|>"
+
+
+def end_of_story_id(tokenizer) -> Optional[int]:
+    """Id of <|endofstory|>, or None when this tokenizer has no story end token."""
+    if tokenizer is None or not hasattr(tokenizer, "token_to_id"):
+        return None
+    tid = tokenizer.token_to_id(END_OF_STORY)
+    return tid if isinstance(tid, int) and tid >= 0 else None
+
+
+def start_of_story_id(tokenizer) -> Optional[int]:
+    """Id of <|startofstory|>, or None when this tokenizer has no story start token."""
+    if tokenizer is None or not hasattr(tokenizer, "token_to_id"):
+        return None
+    tid = tokenizer.token_to_id(START_OF_STORY)
+    return tid if isinstance(tid, int) and tid >= 0 else None
+
 
 def _word_tokens(text: str) -> List[str]:
     """Split on whitespace; keep spaces as separate tokens so decode round-trips."""
@@ -182,6 +201,49 @@ class BPETokenizer:
                         ids.append(cid)
         cache[word] = ids
         return ids
+
+    def add_special_token(self, token: str) -> int:
+        """Append one special token. Existing ids stay put. Returns its id."""
+        existing = self._token_to_id.get(token)
+        if existing is not None:
+            return int(existing)
+        idx = int(self.vocab_size)
+        self.vocab.append(token)
+        self._token_to_id[token] = idx
+        self._id_to_token[idx] = token
+        self.vocab_size = len(self.vocab)
+        return idx
+
+    def encode_stories(
+        self,
+        stories: Iterable[str],
+        eos_id: int,
+        workers: int = 1,
+        sos_id: Optional[int] = None,
+    ):
+        """Concatenate stories. Each span is [start, end) and ends on eos_id.
+
+        When sos_id is set, that id is the first token of every span.
+        workers is accepted so callers can ask for a parallel encode; the
+        result matches the single-threaded encode (shared word cache).
+        """
+        import numpy as np
+
+        del workers  # sequential encode keeps the word cache deterministic
+        eos = int(eos_id)
+        sos = None if sos_id is None else int(sos_id)
+        flat: List[int] = []
+        spans: List[Tuple[int, int]] = []
+        for story in stories:
+            start = len(flat)
+            if sos is not None:
+                flat.append(sos)
+            flat.extend(self.encode(story))
+            flat.append(eos)
+            spans.append((start, len(flat)))
+        ids = np.asarray(flat, dtype=np.int64)
+        span_arr = np.asarray(spans, dtype=np.int64).reshape(-1, 2)
+        return ids, span_arr
 
     def encode(self, text: str) -> List[int]:
         ids: List[int] = []

@@ -29,6 +29,10 @@ def add_trace_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--trace-neurons", action="store_true", help="Dump per-layer activation mean/std/norm on traced steps")
     group.add_argument("--trace-vectorization", action="store_true", help="Print GEMM shapes and CUDA grid/block launches on traced steps")
     group.add_argument("--trace-every", type=int, default=None, help="Emit traces every N steps (default: 10%% of total training steps; ignored for generate/interactive where it defaults to every step)")
+    group.add_argument(
+        "--no-traces", action="store_true",
+        help="Skip quarterly trace dumps. Generate probes still run unless --no-generate-probe is set.",
+    )
 
 
 def add_generate_decode_args(parser: argparse.ArgumentParser) -> None:
@@ -267,6 +271,11 @@ def build_tracer(args, default_trace_every: int = 100) -> TraceContext:
     resolved = args.trace_every if getattr(args, "trace_every", None) is not None else default_trace_every
     tracer.trace_every = max(1, resolved)
     return tracer
+
+
+def traces_disabled(args) -> bool:
+    """True when --no-traces is set. Quarterly dumps stay off."""
+    return bool(getattr(args, "no_traces", False))
 
 
 def load_config(path: str) -> Dict:

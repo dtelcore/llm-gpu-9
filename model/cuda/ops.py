@@ -26,7 +26,9 @@ from model.cuda.kernels import CUDA_SOURCE  # noqa: E402
 _free0, _total0 = cuda.mem_get_info()
 _baseline_driver_used = int(_total0 - _free0)
 
-_mod = SourceModule(CUDA_SOURCE, options=_env.NVCC_OPTIONS)
+# no_extern_c: PyCUDA's default wrapper would put cuda_fp16.h inside extern "C".
+# CUDA 13 declares C++ half operators there, which cannot have C linkage.
+_mod = SourceModule(CUDA_SOURCE, options=_env.NVCC_OPTIONS, no_extern_c=True)
 
 TILE_SIZE = 16  # shared-memory tiled GEMM (sm_35 / GT 730)
 _gemm_kernel = _mod.get_function("gemm_fp32")
@@ -1081,8 +1083,9 @@ def residual_layernorm_with_cache(
     gamma: gpuarray.GPUArray,
     beta: gpuarray.GPUArray,
     eps: float = 1e-5,
+    scale: float = 1.0,
 ) -> tuple:
-    """Fused x_out = x + residual; y = LN(x_out). Returns (x_out, y, xhat, invstd).
+    """Fused x_out = x + scale * residual; y = LN(x_out). Returns (x_out, y, xhat, invstd).
 
     y/xhat/invstd are cached for backward — not pooled. x_out becomes the residual stream.
     """
@@ -1097,7 +1100,7 @@ def residual_layernorm_with_cache(
     shared_bytes = threads * np.dtype(np.float32).itemsize
     _residual_layernorm_cache_kernel(
         x, residual, x_out, y, xhat, invstd_row, gamma, beta,
-        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows), np.float32(scale),
         block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
     )
     return x_out, y, xhat, invstd_row
@@ -1108,8 +1111,9 @@ def residual_rmsnorm_with_cache(
     residual: gpuarray.GPUArray,
     gamma: gpuarray.GPUArray,
     eps: float = 1e-5,
+    scale: float = 1.0,
 ) -> tuple:
-    """Fused x_out = x + residual; y = RMSNorm(x_out). Returns (x_out, y, xhat, invrms)."""
+    """Fused x_out = x + scale * residual; y = RMSNorm(x_out). Returns (x_out, y, xhat, invrms)."""
     assert x.shape == residual.shape
     hidden_dim = int(x.shape[-1])
     total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
@@ -1121,7 +1125,7 @@ def residual_rmsnorm_with_cache(
     shared_bytes = threads * np.dtype(np.float32).itemsize
     _residual_rmsnorm_cache_kernel(
         x, residual, x_out, y, xhat, invrms_row, gamma,
-        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows), np.float32(scale),
         block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
     )
     return x_out, y, xhat, invrms_row

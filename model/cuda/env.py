@@ -49,11 +49,19 @@ def configure() -> None:
     _configured = True
 
 
-# Planner cap carried over from the Apple tree. Tests assert this exact value.
-# The 1660 Ti has 6 GB; raise this only together with those tests.
-PROCESS_BUDGET_BYTES = 2 * 1024 ** 3
+# Planner cap for this 6 GB 1660 Ti. Tests assert this exact value.
+# The runtime soft guard stays 5.5 GB.
+PROCESS_BUDGET_BYTES = 5 * 1024 ** 3
 SOFT_MACHINE_BYTES = int(5.5 * 1024 ** 3)
 PEAK_TRANSIENT_BYTES = 64 * 1024 ** 2
+
+
+def process_budget_label() -> str:
+    """Human size of PROCESS_BUDGET_BYTES, e.g. '5 GB'."""
+    gb = PROCESS_BUDGET_BYTES / (1024 ** 3)
+    if abs(gb - round(gb)) < 1e-6:
+        return f"{int(round(gb))} GB"
+    return f"{gb:g} GB"
 
 _peak_bytes = 0
 
@@ -97,7 +105,7 @@ def check_memory(where: str = "") -> dict:
     loc = f" ({where})" if where else ""
     if process_budget_exceeded(active, peak, PROCESS_BUDGET_BYTES, PEAK_TRANSIENT_BYTES):
         raise MemoryBudgetError(
-            f"process VRAM exceeded 2 GB budget{loc}: "
+            f"process VRAM exceeded {process_budget_label()} budget{loc}: "
             f"active={active / (1024 ** 2):.1f} MB peak={peak / (1024 ** 2):.1f} MB"
         )
     if process_budget_exceeded(active, peak, SOFT_MACHINE_BYTES, PEAK_TRANSIENT_BYTES):

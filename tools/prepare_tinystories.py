@@ -10,8 +10,8 @@ Output under data/tinystories/ (gitignored):
   manifest.json          shard order, vocab sha, token counts
 
 --pack-stories writes a separate corpus (default data/tinystories_packed):
-each story is followed by <|endofstory|>, and tokens/*.spans.npy records
-[start, end) per story. Training windows are cut on those spans.
+each story is <|startofstory|> ... <|endofstory|>, and tokens/*.spans.npy
+records [start, end) per story. Training windows are cut on those spans.
 Reuse the existing 6000-merge vocab with --vocab so ids stay stable.
 
 Does not read data/train.txt. Does not train a cabinet BPE.
@@ -45,8 +45,27 @@ DEFAULT_MAX_CHARS = 50_000_000
 
 
 def collapse_story_line(text: str) -> str:
-    """One story, one line. Internal newlines become spaces."""
-    return " ".join((text or "").split())
+    """One story, one line. Newlines collapse, curly punctuation becomes ASCII."""
+    line = " ".join((text or "").split())
+    for src, dst in (
+        ("\u2018", "'"),
+        ("\u2019", "'"),
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("\u2026", "..."),
+    ):
+        line = line.replace(src, dst)
+    line = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in line)
+    return " ".join(line.split())
+
+
+def story_with_boundaries(body: str) -> str:
+    """Sanitized story wrapped in the start and end markers."""
+    from tokenizer.bpe import END_OF_STORY, START_OF_STORY
+
+    return f"{START_OF_STORY} {body} {END_OF_STORY}"
 
 
 def write_text_shard(path: Path, stories: Iterable[str]) -> int:
@@ -207,7 +226,7 @@ def prepare(
     if text_only:
         return {"text_train": [str(p) for p in written_train], "text_valid": [str(p) for p in written_valid]}
 
-    from tokenizer.bpe import END_OF_STORY, BPETokenizer
+    from tokenizer.bpe import END_OF_STORY, START_OF_STORY, BPETokenizer
 
     if vocab_path is not None:
         tokenizer = BPETokenizer.load(vocab_path)
@@ -217,6 +236,7 @@ def prepare(
             num_merges=int(bpe_merges),
             max_chars=int(max_chars),
         )
+    sos_id = tokenizer.add_special_token(START_OF_STORY) if pack_stories else None
     eos_id = tokenizer.add_special_token(END_OF_STORY) if pack_stories else None
     saved_vocab = out_dir / "vocab.json"
     tokenizer.save(saved_vocab)
@@ -224,7 +244,9 @@ def prepare(
     def _encode_shard(shard: Path) -> tuple[object, Optional[str]]:
         docs = list(iter_story_lines([shard]))
         if pack_stories:
-            ids, spans = tokenizer.encode_stories(docs, int(eos_id))
+            wrapped = out_dir / "text" / shard.name
+            write_text_shard(wrapped, [story_with_boundaries(doc) for doc in docs])
+            ids, spans = tokenizer.encode_stories(docs, int(eos_id), sos_id=int(sos_id))
             span_path = token_dir / f"{shard.stem}.spans.npy"
             np_save_int64(span_path, spans)
             return ids.astype("int32"), f"tokens/{span_path.name}"
@@ -258,6 +280,8 @@ def prepare(
     if pack_stories:
         extra = {
             "pack": "story",
+            "sos_token": START_OF_STORY,
+            "sos_id": int(sos_id),
             "eos_token": END_OF_STORY,
             "eos_id": int(eos_id),
             "train_span_shards": train_spans,
@@ -299,7 +323,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--text-only", action="store_true", help="Write text shards only (no BPE)")
     parser.add_argument(
         "--pack-stories", action="store_true",
-        help="Append <|endofstory|> and write per-story spans. Refuses to overwrite data/tinystories.",
+        help="Wrap each story in <|startofstory|> and <|endofstory|> and write per-story spans.",
     )
     parser.add_argument("--vocab", type=str, default=None, help="Reuse this BPE vocab instead of training one")
     parser.add_argument("--text-dir", type=str, default=None, help="Read story lines from this directory")

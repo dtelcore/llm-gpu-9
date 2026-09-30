@@ -168,6 +168,10 @@ def verify_story_pack(token_dir: str | Path) -> dict[str, Any]:
             ends = spans[:, 1] - 1
             if not np.all(tokens[ends] == eos_id):
                 problems.append(f"{label}: a story does not end on eos_id {eos_id}")
+            if "sos_id" in manifest:
+                sos_id = int(manifest["sos_id"])
+                if not np.all(tokens[spans[:, 0]] == sos_id):
+                    problems.append(f"{label}: a story does not start on sos_id {sos_id}")
     if problems:
         raise ValueError("story pack check failed: " + "; ".join(problems))
     return manifest

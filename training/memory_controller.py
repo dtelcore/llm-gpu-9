@@ -1,9 +1,9 @@
-"""Size batch, context, and activations to the hardcoded 2 GB process cap.
+"""Size batch, context, and activations to the hardcoded process cap.
 
 Architecture (C, L, H, V) is never changed. The live path keeps host NumPy
-weights, Metal mirrors, Adam m/v, grads, and explicit VJP caches in the same
-unified-memory process; ``PROCESS_BUDGET_BYTES`` in ``model.cuda.env`` is the
-limit (2 GB). This module does not raise that cap.
+weights, CUDA mirrors, Adam m/v, grads, and explicit VJP caches in the same
+process; ``PROCESS_BUDGET_BYTES`` in ``model.cuda.env`` is the limit (5 GB).
+This module does not raise that cap.
 
 Knobs, cheapest quality impact first:
   1. Realize the MLX graph after each layer (drop lazy intermediates)
@@ -29,7 +29,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 from logging_config import logger
-from model.cuda.env import PROCESS_BUDGET_BYTES, MemoryBudgetError
+from model.cuda.env import PROCESS_BUDGET_BYTES, MemoryBudgetError, process_budget_label
 
 _F32 = 4
 _DEFAULT_HEADROOM = 0.15
@@ -45,7 +45,7 @@ def process_budget_bytes() -> int:
 
 
 def usable_bytes(headroom: float = _DEFAULT_HEADROOM) -> int:
-    """Plan against this many bytes so compile/scratch still fit under 2 GB."""
+    """Plan against this many bytes so compile/scratch still fit under the process cap."""
     h = min(0.45, max(0.0, float(headroom)))
     return int(process_budget_bytes() * (1.0 - h))
 
@@ -278,7 +278,7 @@ def plan_train(
     layer_strategy: str = "resident",
     allow_stream: bool = True,
 ) -> MemoryPlan:
-    """Return a plan that fits the 2 GB cap, or ``fits=False`` if impossible."""
+    """Return a plan that fits the process cap, or ``fits=False`` if impossible."""
     usable = usable_bytes(headroom)
     budget = process_budget_bytes()
     requested_batch = max(1, int(batch_size))
@@ -556,7 +556,7 @@ def apply_train_plan(
     allow_stream: bool = True,
     force_stream: bool = False,
 ) -> MemoryPlan:
-    """Mutate config/hyperparams to the plan. Raises if the 2 GB cap cannot be met."""
+    """Mutate config/hyperparams to the plan. Raises if the process cap cannot be met."""
     strategy = str(getattr(gpt_config, "layer_strategy", "resident"))
     if force_stream:
         strategy = "stream"
@@ -581,7 +581,7 @@ def apply_train_plan(
     )
     if not plan.fits:
         raise MemoryBudgetError(
-            f"process unified memory cannot fit this architecture under 2 GB "
+            f"process unified memory cannot fit this architecture under {process_budget_label()} "
             f"(C={gpt_config.embedding_dim} L={gpt_config.num_layers} "
             f"H={gpt_config.num_heads} V={gpt_config.vocab_size} params={n_params:,}): "
             f"estimate={plan.estimated_bytes / (1024 ** 2):.0f} MB "
@@ -645,7 +645,7 @@ def apply_generate_plan(
     )
     if not plan.fits:
         raise MemoryBudgetError(
-            f"generate cannot fit under 2 GB: estimate="
+            f"generate cannot fit under {process_budget_label()}: estimate="
             f"{plan.estimated_bytes / (1024 ** 2):.0f} MB "
             f"usable={plan.usable_bytes / (1024 ** 2):.0f} MB "
             f"T={plan.max_len} L={gpt_config.num_layers} C={gpt_config.embedding_dim}"

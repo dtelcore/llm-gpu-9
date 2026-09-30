@@ -38,6 +38,10 @@ DEFAULT_TRAINING_LOG = OUTPUT_LOGS / "training.log"
 DEFAULT_TRAINING_PLOT = OUTPUT_LOGS / "training_plot_latest.png"
 DEFAULT_LANDSCAPE_PLOT = OUTPUT_LOGS / "loss_landscape_latest.png"
 
+DEFAULT_CHAT_URL = "http://127.0.0.1:7860"
+DEFAULT_VIEWER_URL = "http://127.0.0.1:7861"
+_WEIGHT_SUFFIXES = {".npz", ".npy", ".npx"}
+
 # Legacy locations (pre-output/ migration) — still honored when passed explicitly.
 LEGACY_LOGS_DIR = PROJECT_ROOT / "logs"
 LEGACY_MODELS_DIR = PROJECT_ROOT / "models"
@@ -72,6 +76,56 @@ def resolve_config_path(path: Optional[Union[str, Path]] = None) -> Path:
     if path is None:
         return DEFAULT_CONFIG_PATH
     return Path(path)
+
+
+def relative_to_project(path: Union[str, Path]) -> str:
+    """Project-relative posix path. Absolute paths outside the repo stay as given."""
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    try:
+        return p.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return Path(path).as_posix()
+
+
+def _is_weight_file(path: Path) -> bool:
+    return path.suffix.lower() in _WEIGHT_SUFFIXES
+
+
+def checkpoint_weights_relpath(checkpoint: Union[str, Path]) -> str:
+    """Relative weights.npz for a checkpoint dir, or the file if one was passed."""
+    path = Path(checkpoint)
+    weights = path if _is_weight_file(path) else path / "weights.npz"
+    return relative_to_project(weights)
+
+
+def _checkpoint_dir(checkpoint: Union[str, Path]) -> Path:
+    path = Path(checkpoint)
+    return path.parent if _is_weight_file(path) else path
+
+
+def viewer_open_url(base: str, checkpoint: Union[str, Path]) -> str:
+    """npzviewer URL that opens this checkpoint's weights."""
+    from urllib.parse import quote
+
+    root = str(base).rstrip("/")
+    raw = str(checkpoint or "").strip()
+    if not raw:
+        return root + "/"
+    return f"{root}/?path={quote(checkpoint_weights_relpath(raw), safe='/')}"
+
+
+def chat_open_url(base: str, checkpoint: Union[str, Path]) -> str:
+    """Chat URL for the checkpoint directory, not the weights file."""
+    from urllib.parse import quote
+
+    root = str(base).rstrip("/")
+    raw = str(checkpoint or "").strip()
+    if not raw:
+        return root + "/"
+    rel = relative_to_project(_checkpoint_dir(raw))
+    return f"{root}/?checkpoint={quote(rel, safe='/')}"
 
 
 def checkpoint_vocab_sidecar(checkpoint_dir: Union[str, Path]) -> Path:

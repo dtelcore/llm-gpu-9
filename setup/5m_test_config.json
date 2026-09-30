@@ -1,0 +1,47 @@
+{
+  "model": {
+    "name": "Chat 5M",
+    "vocab_size": null,
+    "max_len": 512,
+    "embedding_dim": 512,
+    "num_heads": 16,
+    "num_layers": 16,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "residual_scale": false,
+    "layer_strategy": "resident",
+    "description": "Chat 5M smoke from the menu. C=256 L=6 H=8 T=128, batch 4, accum 4. One packed TinyStories shard."
+  },
+  "dataset": {
+    "name": "tinystories_packed/text/train-00003",
+    "combine": false,
+    "path": "data/tinystories_packed/text/train-00003.txt",
+    "tokenizer": "bpe",
+    "bpe_merges": 200,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "Chat 5M Run",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "batch_size": 2,
+    "num_epochs": 1,
+    "warmup_steps": 1000,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 32,
+    "window_stride": 64,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08
+  },
+  "metadata": {
+    "created": "2026-10-01",
+    "description": "Same recipe as the menu 5mTest run. Reads the shard from disk instead of embedding it. Checkpoint output/checkpoints/5mTest reuses the token cache from that run."
+  }
+}

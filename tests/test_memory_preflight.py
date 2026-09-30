@@ -1,4 +1,4 @@
-"""2 GB train-step preflight: refuse L=32 / 25M before allocating."""
+"""Train-step preflight: refuse a step that exceeds the process budget."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ class TrainMemoryPreflightTests(unittest.TestCase):
             )
         msg = str(ctx.exception)
         self.assertIn("L=32", msg)
-        self.assertIn("2 GB", msg)
+        self.assertIn("5 GB", msg)
 
     def test_peak_transient_does_not_trip_when_active_is_under(self):
         active = 638 * 1024 * 1024

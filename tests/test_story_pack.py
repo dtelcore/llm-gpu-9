@@ -73,6 +73,13 @@ class PackEncodeTests(unittest.TestCase):
         np.testing.assert_array_equal(spans[1:, 0], spans[:-1, 1])
         self.assertTrue(np.all(ids[spans[:, 1] - 1] == eos))
         self.assertEqual(tok.decode(ids[int(spans[0, 0]): int(spans[0, 1]) - 1]), corpus[0])
+        from tokenizer.bpe import START_OF_STORY
+        sos = tok.add_special_token(START_OF_STORY)
+        wrapped, wrapped_spans = tok.encode_stories(corpus, eos, sos_id=sos, workers=1)
+        self.assertTrue(np.all(wrapped[wrapped_spans[:, 0]] == sos))
+        self.assertTrue(np.all(wrapped[wrapped_spans[:, 1] - 1] == eos))
+        body = wrapped[int(wrapped_spans[0, 0]) + 1: int(wrapped_spans[0, 1]) - 1]
+        self.assertEqual(tok.decode(body), corpus[0])
         again, _ = tok.encode_stories(corpus, eos, workers=2)
         np.testing.assert_array_equal(ids, again)
 

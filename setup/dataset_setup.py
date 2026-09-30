@@ -332,9 +332,20 @@ class DatasetLoader:
             return {}
 
         discovered = {}
-        for filepath in sorted(data_dir.glob(pattern)):
-            discovered[filepath.stem] = filepath
-            self._discovered[filepath.stem] = filepath
+        files = sorted(p for p in data_dir.rglob(pattern) if p.is_file())
+        by_stem: Dict[str, List[Path]] = {}
+        for filepath in files:
+            by_stem.setdefault(filepath.stem, []).append(filepath)
+        for filepath in files:
+            # Unique stems stay as the filename so data/story.txt is still "story".
+            # The same stem in two folders (train-00000 under text/ and packed/) keeps
+            # the path under data/ so the menu can tell them apart.
+            if len(by_stem[filepath.stem]) == 1:
+                name = filepath.stem
+            else:
+                name = filepath.relative_to(data_dir).with_suffix("").as_posix()
+            discovered[name] = filepath
+            self._discovered[name] = filepath
 
         logger.info(f"Discovered {len(discovered)} dataset file(s) in {directory} (not yet loaded)")
         return discovered
@@ -411,12 +422,19 @@ class DatasetLoader:
         all_datasets = {}
 
         if self._discovered:
+            top_level = [
+                path for path in self._discovered.values()
+                if path.parent == Path(self.data_dir)
+            ]
+        else:
+            top_level = []
+        if top_level:
             all_datasets[COMBINED_DATASET_NAME] = {
                 'type': 'combined',
                 'sentences': None,
                 'source': self.data_dir,
-                'file_count': len(self._discovered),
-                'description': f'Combine all {len(self._discovered)} .txt file(s) in {self.data_dir}',
+                'file_count': len(top_level),
+                'description': f'Combine all {len(top_level)} .txt file(s) in {self.data_dir}',
             }
         
         # Add builtin datasets
@@ -564,8 +582,8 @@ def load_dataset_interactive(model_config: Optional[Dict] = None, data_dir: str 
         Tuple of (corpus, dataset_name)
     """
     loader = DatasetLoader(data_dir=data_dir)
-    
-    discovered = [name for name, info in loader.datasets.items()]
+
+    discovered = list(loader._discovered)
     if discovered:
         print(f"\n✓ Found {len(discovered)} dataset file(s) in '{data_dir}/': {', '.join(discovered)}")
     
@@ -584,8 +602,12 @@ def load_dataset_interactive(model_config: Optional[Dict] = None, data_dir: str 
         if use_recommended != 'n':
             try:
                 corpus = loader.load_by_name(recommended)
-            except ValueError:
-                corpus = loader.load_builtin(recommended)
+            except (ValueError, KeyError, FileNotFoundError):
+                print(f"  '{recommended}' is not a file in '{data_dir}/'. Pick from the list.")
+                corpus = loader.interactive_select()
+                analyzer = DatasetAnalyzer(corpus)
+                analyzer.print_stats()
+                return corpus, loader.current_dataset
             analyzer = DatasetAnalyzer(corpus)
             analyzer.print_stats()
             return corpus, loader.current_dataset

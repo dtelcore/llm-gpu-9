@@ -16,6 +16,7 @@ step before any accumulation, and require a POWER-OF-TWO block size
 
 CUDA_SOURCE = r"""
 #include <cuda_fp16.h>
+extern "C" {
 
 // Tiled GEMM for Kepler (sm_35). TILE=16 fits well on GT 730.
 #define GEMM_TILE 16
@@ -327,7 +328,7 @@ __global__ void residual_layernorm_cache_fp32(
     const float* x, const float* residual,
     float* x_out, float* y, float* xhat, float* invstd_row,
     const float* gamma, const float* beta,
-    int hidden_dim, float eps, int total_rows
+    int hidden_dim, float eps, int total_rows, float scale
 ) {
     extern __shared__ float sdata[];
 
@@ -339,7 +340,7 @@ __global__ void residual_layernorm_cache_fp32(
 
     float local_sum = 0.0f;
     for (int i = tid; i < hidden_dim; i += blockDim.x) {
-        float v = x[offset + i] + residual[offset + i];
+        float v = x[offset + i] + scale * residual[offset + i];
         x_out[offset + i] = v;
         local_sum += v;
     }
@@ -500,7 +501,7 @@ __global__ void residual_rmsnorm_cache_fp32(
     const float* x, const float* residual,
     float* x_out, float* y, float* xhat, float* invrms_row,
     const float* gamma,
-    int hidden_dim, float eps, int total_rows
+    int hidden_dim, float eps, int total_rows, float scale
 ) {
     extern __shared__ float sdata[];
     int row = blockIdx.x;
@@ -510,7 +511,7 @@ __global__ void residual_rmsnorm_cache_fp32(
 
     float local_sq = 0.0f;
     for (int i = tid; i < hidden_dim; i += blockDim.x) {
-        float v = x[offset + i] + residual[offset + i];
+        float v = x[offset + i] + scale * residual[offset + i];
         x_out[offset + i] = v;
         local_sq += v * v;
     }
@@ -1621,5 +1622,6 @@ __global__ void topk_mask_inplace_fp32(float* __restrict__ x, int n, int k) {
             if (x[i] < thresh) x[i] = -1e30f;
         }
     }
+}
 }
 """

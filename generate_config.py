@@ -4,7 +4,7 @@ generate_config.py
 Interactive (or flag-driven) writer for setup/*.json training recipes.
 
 Tweaks C / H / L / T / B / accum, residual scale, layer streaming, and dataset
-without going through ``--menu`` (which overrides the JSON). Prints a 2 GB
+without going through ``--menu`` (which overrides the JSON). Prints a 5 GB
 train estimate and an ``auto_train.py`` command. New C/L/H always needs a new
 checkpoint — do not resume chat8b / run8+16 into a different width or depth.
 
@@ -180,7 +180,7 @@ def apply_overrides(
         "layer_strategy": strategy,
         "description": (
             f"{display}. H={H}, residual_scale={'on' if residual_scale else 'off'}, "
-            f"layers={strategy}. 2 GB process cap is hardcoded."
+            f"layers={strategy}. 5 GB process cap is hardcoded."
         ),
     })
     hyper.update({
@@ -275,7 +275,7 @@ def format_report(cfg: Mapping[str, Any], path: Path) -> str:
             f"~{n_params:,} params (vocab~{_EST_VOCAB})"
         ),
         f"  [memory] {plan.summary_line()}",
-        f"  usable={usable_bytes() / (1024 ** 2):.0f}MB  (2 GB cap is hardcoded)",
+        f"  usable={usable_bytes() / (1024 ** 2):.0f}MB  (5 GB cap is hardcoded)",
         "",
         "Train (new checkpoint, no --menu, no --resume of a different C/L):",
         (
@@ -286,7 +286,7 @@ def format_report(cfg: Mapping[str, Any], path: Path) -> str:
         ),
     ]
     if not plan.fits:
-        lines.append("  WARNING: estimate does not fit 2 GB even after autoscale.")
+        lines.append("  WARNING: estimate does not fit 5 GB even after autoscale.")
     elif plan.actions:
         lines.append("  NOTE: controller will change B/T/stream at train start; C/L/H stay.")
     if int(model["num_layers"]) >= 12 and model.get("layer_strategy") != "stream":
@@ -364,7 +364,7 @@ def _pick_base(from_path: Optional[Path]) -> Tuple[str, Dict[str, Any], Path]:
 
 
 def run_interactive(args: argparse.Namespace) -> Dict[str, Any]:
-    print("\nApple MLX recipe generator (2 GB cap is hardcoded; C/L/H never autoscale)\n")
+    print("\nRecipe generator (5 GB cap is hardcoded; C/L/H never autoscale)\n")
     from_path = Path(args.from_config) if args.from_config else None
     kind, recipe, _src = _pick_base(from_path)
     model = recipe["model"]
@@ -431,7 +431,7 @@ def _rel(path: Path) -> Path:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Write a setup/*.json recipe (C/H/L/T/B) with a 2 GB train estimate",
+        description="Write a setup/*.json recipe (C/H/L/T/B) with a 5 GB train estimate",
     )
     parser.add_argument("--from", dest="from_config", default=None, help="Base recipe JSON")
     parser.add_argument("--output", type=str, default=None, help="Destination JSON path")

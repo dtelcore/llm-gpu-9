@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Apple MLX</title>
+  <style>
+    :root {
+      --bg: #0b0b0f;
+      --bar: #111217;
+      --panel: #18181f;
+      --border: #2a2a33;
+      --text: #ececf1;
+      --muted: #9a9aa8;
+      --accent: #8b5cf6;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+    .shell { height: 100%; display: flex; flex-direction: column; }
+    header.bar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 10px 14px; background: var(--bar); border-bottom: 1px solid var(--border);
+    }
+    header.bar h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 650; }
+    header.bar span, header.bar label { font-size: 12px; color: var(--muted); }
+    select, button { font: inherit; }
+    select {
+      min-width: 220px; max-width: 42vw;
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px;
+    }
+    .btn { background: var(--accent); color: white; border: 0; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-weight: 600; }
+    .btn:disabled { opacity: .5; cursor: wait; }
+    .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); text-decoration: none; }
+    .btn.ghost.active { border-color: var(--accent); color: #c4b5fd; }
+    #status { flex: 1; min-width: 140px; }
+    iframe { flex: 1; width: 100%; border: 0; background: var(--bg); }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="bar">
+      <h1>Apple MLX</h1>
+      <label for="model">Model</label>
+      <select id="model">
+        <option value="">Select a checkpoint…</option>
+        {% for row in models %}
+        <option value="{{ row.checkpoint }}"
+          data-weights="{{ row.weights }}"
+          {% if selected and selected.checkpoint == row.checkpoint %}selected{% endif %}>
+          {{ row.name }}{% if row.title %} — {{ row.title }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+      <button class="btn" id="load" type="button">Load</button>
+      <a class="btn ghost{% if view not in ['weights', 'train'] %} active{% endif %}" id="tab-chat" href="/?view=chat">Chat</a>
+      <a class="btn ghost{% if view == 'weights' %} active{% endif %}" id="tab-weights" href="/?view=weights">Weights</a>
+      <a class="btn ghost{% if view == 'train' %} active{% endif %}" id="tab-train" href="/?view=train">Train</a>
+      <span id="status">{% if loaded and selected %}Metal · {{ selected.name }}{% elif selected %}Selected {{ selected.name }} — press Load{% else %}No model loaded{% endif %}</span>
+      <span id="autotrainer"></span>
+    </header>
+    <iframe id="pane" title="Apple MLX panel"></iframe>
+  </div>
+  <script>
+    const models = {{ models|tojson }};
+    const selected = {{ (selected.checkpoint if selected else "")|tojson }};
+    const loaded = {{ loaded|tojson }};
+    const view = {{ view|tojson }};
+    const modelEl = document.getElementById("model");
+    const loadBtn = document.getElementById("load");
+    const status = document.getElementById("status");
+    const pane = document.getElementById("pane");
+    const tabChat = document.getElementById("tab-chat");
+    const tabWeights = document.getElementById("tab-weights");
+    const tabTrain = document.getElementById("tab-train");
+
+    function currentRow() {
+      const id = modelEl.value;
+      return models.find((row) => row.checkpoint === id) || null;
+    }
+
+    function paneUrl(which, row) {
+      if (which === "weights") {
+        const path = (row && row.weights) || "";
+        return path ? "/weights/?path=" + encodeURIComponent(path) : "/weights/";
+      }
+      if (which === "train") {
+        return "/train/";
+      }
+      return "/chat/";
+    }
+
+    function show(which) {
+      const row = currentRow();
+      pane.src = paneUrl(which, row);
+      tabChat.classList.toggle("active", which === "chat");
+      tabWeights.classList.toggle("active", which === "weights");
+      tabTrain.classList.toggle("active", which === "train");
+      const u = new URL(location.href);
+      u.searchParams.set("view", which);
+      history.replaceState({}, "", u);
+    }
+
+    tabChat.addEventListener("click", (e) => { e.preventDefault(); show("chat"); });
+    tabWeights.addEventListener("click", (e) => { e.preventDefault(); show("weights"); });
+    tabTrain.addEventListener("click", (e) => { e.preventDefault(); show("train"); });
+
+    loadBtn.addEventListener("click", async () => {
+      const row = currentRow();
+      if (!row) {
+        status.textContent = "Pick a checkpoint first.";
+        return;
+      }
+      if (loaded && selected && selected !== row.checkpoint) {
+        if (!confirm("Replace the Metal session with " + row.name + "? One checkpoint only (2 GB).")) return;
+      }
+      loadBtn.disabled = true;
+      status.textContent = loaded && selected !== row.checkpoint
+        ? "Restarting onto " + row.name + "…"
+        : "Loading " + row.name + " onto Metal…";
+      try {
+        const res = await fetch("/api/select", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ checkpoint: row.checkpoint }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "load failed");
+        if (data.restart) {
+          status.textContent = "Process restarting with " + row.name + "…";
+          setTimeout(() => { location.href = "/?view=" + (view || "chat"); }, 1200);
+          return;
+        }
+        location.href = "/?view=" + (view || "chat");
+      } catch (err) {
+        status.textContent = String(err);
+        loadBtn.disabled = false;
+      }
+    });
+
+    show(view === "weights" ? "weights" : view === "train" ? "train" : "chat");
+
+    async function pollAutotrainer() {
+      const el = document.getElementById("autotrainer");
+      if (!el) return;
+      try {
+        const res = await fetch("/api/autotrainer");
+        const data = await res.json();
+        if (data && data.needs_chat_restart && data.checkpoint) {
+          el.textContent = "Promoted " + data.checkpoint + " — restart chat to load (no hot-swap).";
+        } else if (data && data.state === "training") {
+          el.textContent = "Autotrainer running — stop App before a Metal train.";
+        } else {
+          el.textContent = "";
+        }
+      } catch (_err) {
+        el.textContent = "";
+      }
+    }
+    pollAutotrainer();
+    setInterval(pollAutotrainer, 15000);
+  </script>
+</body>
+</html>

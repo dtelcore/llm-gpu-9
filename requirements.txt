@@ -1,0 +1,5 @@
+pycuda
+numpy>=1.24,<3
+matplotlib
+tqdm
+flask>=3.0,<4

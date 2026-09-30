@@ -1,0 +1,44 @@
+{
+  "model": {
+    "name": "Chat 5M",
+    "vocab_size": null,
+    "max_len": 128,
+    "embedding_dim": 256,
+    "num_heads": 8,
+    "num_layers": 6,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "description": "Ultra-tiny dialogue model. ~5M params (C=256, L=6, T=128). batch=4, accum=4, seq=128. Do not resume L=4 checkpoints."
+  },
+  "dataset": {
+    "name": "data_dir",
+    "combine": true,
+    "tokenizer": "bpe",
+    "bpe_merges": 200,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "Chat 5M Run",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "batch_size": 4,
+    "num_epochs": 1,
+    "warmup_steps": 1000,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 4,
+    "window_stride": 64,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8
+  },
+  "metadata": {
+    "created": "chat-5m",
+    "description": "Ready-to-run Chat 5M config. Combines every data/*.txt file (stories + story_chat). Cannot resume L=4 TinyStories checkpoints."
+  }
+}

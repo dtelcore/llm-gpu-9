@@ -1,0 +1,43 @@
+{
+  "model": {
+    "name": "Tiny Stories v2 (big BPE, T=256)",
+    "vocab_size": null,
+    "max_len": 256,
+    "embedding_dim": 256,
+    "num_heads": 8,
+    "num_layers": 4,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "description": "TinyStories rerun: same C=256/L=4 as 256-8-4-4 but bpe_merges=4000 and max_len=256 to fix the context/tokenizer bottleneck. ~3.9M params with tied embeddings."
+  },
+  "dataset": {
+    "name": "tiny_stories",
+    "tokenizer": "bpe",
+    "bpe_merges": 4000,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "TinyStories v2",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.01,
+    "batch_size": 4,
+    "num_epochs": 1,
+    "warmup_steps": 1000,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 4,
+    "window_stride": 128,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8
+  },
+  "metadata": {
+    "created": "2026-08-20",
+    "description": "v2 recipe after 256-8-4-4 plateaued at loss ~1.29: bigger vocab (4000 merges, ~4k tokens) so 256-token context holds a full short story; cosine decay to 0.1 instead of flat LR."
+  }
+}

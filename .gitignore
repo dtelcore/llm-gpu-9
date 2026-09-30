@@ -1,0 +1,34 @@
+venv/
+data/
+__pycache__/
+*.pyc
+*.log
+*.npz
+data/*.txt
+
+# Local editor and agent state
+.cursor/
+
+# Secrets
+.env
+.env.*
+
+# Legacy artifact dirs (pre-output/ migration)
+logs/
+models/
+
+# Runtime artifacts under output/ — keep private by default.
+# Re-include only the small scientific-control / docs the README links to.
+output/*
+!output/README.md
+!output/baselines/
+!output/baselines/*.json
+!output/releases/
+!output/releases/v0.1.2/
+!output/releases/v0.1.2/**
+!output/reports/
+!output/reports/evolution.html
+
+# Training config may embed full corpora when saved incorrectly — never commit it.
+setup/training_config.json
+output/configs/training_config.json

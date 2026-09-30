@@ -1,0 +1,48 @@
+{
+  "model": {
+    "name": "english_tinystories_c256_l6",
+    "vocab_size": null,
+    "max_len": 256,
+    "embedding_dim": 256,
+    "num_heads": 8,
+    "num_layers": 6,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "residual_scale": true,
+    "layer_strategy": "resident",
+    "description": "Open English on TinyStories only. C=256 L=6 H=8 T=256, GPT-2 residual scale 1/sqrt(2L). Fresh TinyStories BPE. Do not --resume a cabinet BPE. 2 GB cap hardcoded."
+  },
+  "dataset": {
+    "name": "tinystories",
+    "combine": false,
+    "tokenizer": "bpe",
+    "bpe_merges": 6000,
+    "vocab_size": null,
+    "vocab_path": "data/tinystories/vocab.json",
+    "token_dir": "data/tinystories"
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "english_tinystories_c256_l6",
+    "learning_rate": 0.0009,
+    "weight_decay": 0.01,
+    "batch_size": 4,
+    "num_epochs": 1,
+    "warmup_steps": 1000,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 4,
+    "window_stride": 128,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8
+  },
+  "metadata": {
+    "created": "english-tinystories-c256-l6",
+    "description": "From-scratch on data/tinystories/ after tools/prepare_tinystories.py. No dataset.path. Do not combine data/*.txt. Do not --resume v7/v8/v9 or English-Phase1. Product chat stays chat_facts_v7. 4096 tokens/step; 50k steps is ~200M tokens."
+  }
+}

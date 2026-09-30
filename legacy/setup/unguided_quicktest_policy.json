@@ -1,0 +1,33 @@
+{
+  "recipe": "legacy/setup/quicktest_config.json",
+  "checkpoint_dir": "output/checkpoints/unguided_quicktest",
+  "run_name": "unguided_quicktest",
+  "max_steps": 8,
+  "eval_every": 4,
+  "log_every": 2,
+  "max_wall_s": 180,
+  "early_stop_patience": 8,
+  "loss_spike_ratio": 4.0,
+  "loss_median_window": 3,
+  "promote_on": {
+    "metric": "val_loss",
+    "mode": "min"
+  },
+  "remix_if": {
+    "cabinet_exact_match_below": 0.0,
+    "after_steps": 1000000,
+    "action": "abort_remix"
+  },
+  "probe_on_stop": false,
+  "probe_n": 8,
+  "hard_limits": {
+    "refuse_resume_on_vocab_mismatch": true,
+    "refuse_existing_v6_v4_dir": true,
+    "always_abort_on_nan": true,
+    "always_abort_on_spike": true
+  },
+  "unguarded_defaults": {
+    "skip_quarantine_on_next_mix": true,
+    "allow_overwrite_latest": true
+  }
+}

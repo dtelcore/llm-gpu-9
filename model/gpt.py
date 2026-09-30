@@ -1,0 +1,1559 @@
+"""
+model/gpt.py
+
+A from-scratch character-level GPT. Forward compute runs through MLX
+ops (`model/mlx/ops.py` via `model/layers.py`) with batched sequences
+stacked as [B*T, C]. Backward is analytic (explicit VJPs on device).
+"""
+
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from model import layers
+from model.config import GPTConfig
+from model.cuda import ops as cuda_ops
+from model.trace import TraceContext
+from model.weights import ModelParameters
+from training.chat_format import trim_generated_stop_strings
+
+EPS = 1e-5
+# Fused GPU attention + full GPU training path (forward, backward, optimizer on device).
+_USE_GPU_ATTENTION = True
+_GPU_TRAINING = True
+
+
+def _gelu_grad(x: np.ndarray) -> np.ndarray:
+    """Derivative of the tanh-approximation GeLU used in model/mlx/kernels.py."""
+    k = 0.79788456
+    c = 0.044715
+    inner = k * (x + c * x**3)
+    tanh_val = np.tanh(inner)
+    sech2 = 1.0 - tanh_val**2
+    return 0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * k * (1.0 + 3.0 * c * x**2)
+
+
+def _layernorm_cache(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: float = EPS):
+    """Host-side recomputation of layernorm mean/invstd/xhat for backward.
+
+    The GPU kernel already produced the forward output (verified to match
+    this formula within 1e-7); this only rebuilds the small per-row stats
+    needed for the analytic backward pass.
+    """
+    mean = x.mean(axis=-1, keepdims=True)
+    var = x.var(axis=-1, keepdims=True)
+    invstd = 1.0 / np.sqrt(var + eps)
+    xhat = (x - mean) * invstd
+    y = xhat * gamma + beta
+    return y, xhat, invstd
+
+
+def _layernorm_backward(dout: np.ndarray, xhat: np.ndarray, invstd: np.ndarray, gamma: np.ndarray):
+    N = xhat.shape[-1]
+    dgamma = np.sum(dout * xhat, axis=0)
+    dbeta = np.sum(dout, axis=0)
+
+    dxhat = dout * gamma
+    sum_dxhat = np.sum(dxhat, axis=-1, keepdims=True)
+    sum_dxhat_xhat = np.sum(dxhat * xhat, axis=-1, keepdims=True)
+    dx = (invstd / N) * (N * dxhat - sum_dxhat - xhat * sum_dxhat_xhat)
+    return dx, dgamma, dbeta
+
+
+def _rmsnorm_cache(x: np.ndarray, gamma: np.ndarray, eps: float = EPS):
+    """Host RMSNorm: inv_rms = 1/sqrt(mean(x^2)+eps); xhat = x * inv_rms; y = xhat * gamma."""
+    mean_sq = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+    inv_rms = (1.0 / np.sqrt(mean_sq + eps)).astype(np.float32)
+    xhat = (x * inv_rms).astype(np.float32)
+    y = (xhat * gamma).astype(np.float32)
+    return y, xhat, inv_rms.astype(np.float32)
+
+
+def _rmsnorm_backward(dout: np.ndarray, xhat: np.ndarray, inv_rms: np.ndarray, gamma: np.ndarray):
+    """Host RMSNorm VJP. Returns (dx, dgamma); no dbeta."""
+    dxhat = dout * gamma
+    mean_dxhat_xhat = np.mean(dxhat * xhat, axis=-1, keepdims=True)
+    dx = inv_rms * (dxhat - xhat * mean_dxhat_xhat)
+    dgamma = np.sum(dout * xhat, axis=0)
+    return dx.astype(np.float32), dgamma.astype(np.float32)
+
+
+def _rope_np(x: np.ndarray, base: float = 10000.0, pos_offset: int = 0, backward: bool = False) -> np.ndarray:
+    """RoPE on [..., T, HD] or [BH, T, HD]. HD even. Returns a copy."""
+    out = np.array(x, dtype=np.float32, copy=True)
+    *lead, T, HD = out.shape
+    assert HD % 2 == 0
+    pairs = HD // 2
+    sign = -1.0 if backward else 1.0
+    freqs = base ** (-2.0 * np.arange(pairs, dtype=np.float64) / HD)
+    pos = (np.arange(T, dtype=np.float64) + pos_offset)[:, None]  # [T, 1]
+    angles = sign * pos * freqs[None, :]  # [T, pairs]
+    c = np.cos(angles).astype(np.float32)
+    s = np.sin(angles).astype(np.float32)
+    flat = out.reshape(-1, T, HD)
+    for b in range(flat.shape[0]):
+        x0 = flat[b, :, 0::2].copy()
+        x1 = flat[b, :, 1::2].copy()
+        flat[b, :, 0::2] = x0 * c - x1 * s
+        flat[b, :, 1::2] = x0 * s + x1 * c
+    return out
+
+
+def _qkv_to_heads(qkv: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
+    """qkv [B*T, 3C] -> q_h,k_h,v_h each [B, H, T, hd]."""
+    c = num_heads * head_dim
+    q, k, v = np.split(qkv, 3, axis=-1)
+    q_h = q.reshape(batch_size, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    k_h = k.reshape(batch_size, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    v_h = v.reshape(batch_size, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    return q_h, k_h, v_h
+
+
+def _batched_attention_host(
+    qkv: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int, scale: float,
+):
+    """CPU causal attention for a stacked batch. qkv is [B*T, 3C]."""
+    B, T, H, hd = batch_size, seq_len, num_heads, head_dim
+    C = H * hd
+    causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
+    q_h, k_h, v_h = _qkv_to_heads(qkv, B, T, H, hd)
+    probs_h = np.empty((B, H, T, T), dtype=np.float32)
+    attn_concat = np.empty((B * T, C), dtype=np.float32)
+
+    for b in range(B):
+        head_out = np.empty((H, T, hd), dtype=np.float32)
+        for hidx in range(H):
+            raw = (q_h[b, hidx] @ k_h[b, hidx].T) * scale
+            raw = np.where(causal_mask, -1e9, raw).astype(np.float32)
+            shifted = raw - np.max(raw, axis=-1, keepdims=True)
+            exp = np.exp(shifted)
+            probs = exp / np.sum(exp, axis=-1, keepdims=True)
+            probs_h[b, hidx] = probs
+            head_out[hidx] = probs @ v_h[b, hidx]
+        attn_concat[b * T:(b + 1) * T] = head_out.transpose(1, 0, 2).reshape(T, C)
+
+    return attn_concat, probs_h, q_h, k_h, v_h
+
+
+def _interleaved_to_heads_host(x: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
+    """[B*T, NH*HD] -> [B*NH, T, HD]."""
+    return (
+        x.reshape(batch_size, seq_len, num_heads, head_dim)
+        .transpose(0, 2, 1, 3)
+        .reshape(batch_size * num_heads, seq_len, head_dim)
+        .astype(np.float32, copy=False)
+    )
+
+
+def _heads_to_interleaved_host(heads: np.ndarray, batch_size: int, seq_len: int, num_heads: int, head_dim: int):
+    """[B*NH, T, HD] -> [B*T, NH*HD]."""
+    return (
+        heads.reshape(batch_size, num_heads, seq_len, head_dim)
+        .transpose(0, 2, 1, 3)
+        .reshape(batch_size * seq_len, num_heads * head_dim)
+        .astype(np.float32, copy=False)
+    )
+
+
+def _causal_attention_decode_host(q_h: np.ndarray, k_h: np.ndarray, v_h: np.ndarray, scale: float):
+    """Last-query causal attention. q [BH,1,hd], k/v [BH,T,hd] → out [BH,1,hd]."""
+    scores = np.matmul(q_h, np.swapaxes(k_h, -1, -2)) * float(scale)
+    scores = scores - np.max(scores, axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs = probs / np.sum(probs, axis=-1, keepdims=True)
+    return np.matmul(probs, v_h).astype(np.float32)
+
+
+def _kv_state_nbytes(kv_state: Dict) -> int:
+    from model.cuda.kv_cache import arena_nbytes
+    return arena_nbytes(kv_state)
+
+
+class GPTModel:
+    def __init__(self, config: GPTConfig, params: ModelParameters) -> None:
+        self.config = config
+        self.params = params
+
+    @property
+    def _use_rmsnorm(self) -> bool:
+        return bool(getattr(self.config, "use_rmsnorm", False))
+
+    @property
+    def _use_rope(self) -> bool:
+        return bool(getattr(self.config, "use_rope", False))
+
+    @property
+    def _grad_checkpoint(self) -> bool:
+        return bool(getattr(self.config, "gradient_checkpointing", False))
+
+    @property
+    def _streaming(self) -> bool:
+        return bool(self.params.streaming())
+
+    def _norm_with_cache_gpu(self, h_d, gamma_d, beta_d=None):
+        if self._use_rmsnorm:
+            return cuda_ops.rmsnorm_with_cache(h_d, gamma_d)
+        return cuda_ops.layernorm_with_cache(h_d, gamma_d, beta_d)
+
+    def _resid_scale(self) -> float:
+        return float(getattr(self.config, "residual_scale", 1.0) or 1.0)
+
+    def _scale_branch_grad(self, d_stream):
+        """d(branch) = residual_scale * d(stream) for x + s*branch."""
+        scale = self._resid_scale()
+        if abs(scale - 1.0) < 1e-12:
+            return d_stream
+        if hasattr(d_stream, "gpudata") or type(d_stream).__name__ in ("DeviceArray", "GPUArray"):
+            return cuda_ops.scale_const(d_stream, scale)
+        return d_stream * scale
+
+    def _eval_stream(self, *arrays) -> None:
+        """Realize the residual stream so unused MLX intermediates can free."""
+        if not getattr(self.config, "eval_per_layer", False) and not self._streaming:
+            return
+        live = [
+            a for a in arrays
+            if a is not None and (hasattr(a, "gpudata") or type(a).__name__ in ("DeviceArray", "GPUArray"))
+        ]
+        if live:
+            cuda_ops.eval_for_host(*live)
+
+    def _residual_norm_with_cache_gpu(self, h_d, residual_d, gamma_d, beta_d=None):
+        scale = self._resid_scale()
+        if self._use_rmsnorm:
+            return cuda_ops.residual_rmsnorm_with_cache(h_d, residual_d, gamma_d, scale=scale)
+        return cuda_ops.residual_layernorm_with_cache(
+            h_d, residual_d, gamma_d, beta_d, scale=scale,
+        )
+
+    def _norm_backward_gpu(self, dout, xhat, inv, gamma_d):
+        if self._use_rmsnorm:
+            dx, dg = cuda_ops.rmsnorm_backward(dout, xhat, inv, gamma_d)
+            return dx, dg, None
+        return cuda_ops.layernorm_backward(dout, xhat, inv, gamma_d)
+
+    def _norm_cache_host(self, x, gamma, beta=None):
+        if self._use_rmsnorm:
+            return _rmsnorm_cache(x, gamma)
+        return _layernorm_cache(x, gamma, beta)
+
+    def _norm_backward_host(self, dout, xhat, inv, gamma):
+        if self._use_rmsnorm:
+            dx, dg = _rmsnorm_backward(dout, xhat, inv, gamma)
+            return dx, dg, None
+        return _layernorm_backward(dout, xhat, inv, gamma)
+
+    # ------------------------------------------------------------------
+    # Forward (batched)
+    # ------------------------------------------------------------------
+
+    def forward_batch(
+        self, token_ids_batch: np.ndarray, tracer: TraceContext = None,
+        need_host_logits: bool = True,
+    ) -> Tuple[np.ndarray, Dict]:
+        """token_ids_batch: [B, T] int. Returns (logits [B, T, V], cache)."""
+        cfg = self.config
+        w = self.params.weights
+        b = self.params.biases
+        dw = self.params.device_weights
+        db = self.params.device_biases
+
+        token_ids_batch = np.asarray(token_ids_batch, dtype=np.int64)
+        if token_ids_batch.ndim == 1:
+            token_ids_batch = token_ids_batch.reshape(1, -1)
+        B, T = token_ids_batch.shape
+        H, hd = cfg.num_heads, cfg.head_dim
+        scale = 1.0 / np.sqrt(hd)
+
+        cache: Dict = {
+            "ids": token_ids_batch, "B": B, "T": T, "batched": True, "gpu": _GPU_TRAINING,
+            "use_rmsnorm": self._use_rmsnorm,
+            "use_rope": self._use_rope,
+            "grad_checkpoint": self._grad_checkpoint,
+        }
+
+        if _GPU_TRAINING:
+            if self._use_rope:
+                h_d = cuda_ops.embedding_lookup_tokens(
+                    token_ids_batch.astype(np.int32), dw["token_embedding"], T,
+                )
+            else:
+                h_d = cuda_ops.embedding_lookup(
+                    token_ids_batch.astype(np.int32),
+                    dw["token_embedding"], dw["position_embedding"], T,
+                )
+            cache["layers"] = []
+            cache["h_in_d"] = []
+            stream = self._streaming
+            kv_arenas = None
+            if stream and getattr(self, "_stream_pack_kv", False):
+                from model.cuda.kv_cache import alloc_layer_arena
+                kv_arenas = [
+                    alloc_layer_arena(B * H, cfg.max_len, hd) for _ in range(cfg.num_layers)
+                ]
+
+            for layer in range(cfg.num_layers):
+                if stream:
+                    self.params.load_layer(layer)
+                cache["h_in_d"].append(h_d)
+                if stream:
+                    cuda_ops.eval_for_host(h_d)
+                keep = not stream
+                arena = kv_arenas[layer] if kv_arenas is not None else None
+                h_d, layer_cache = self._block_forward_gpu(
+                    layer, h_d, B, T, H, hd, scale, tracer=tracer,
+                    keep_cache=keep, kv_arena=arena,
+                )
+                cuda_ops.eval_for_host(h_d)
+                cache["layers"].append(layer_cache)
+                if stream:
+                    self.params.unload_layer(layer)
+
+            fbeta = None if self._use_rmsnorm else db.get("final_ln_beta")
+            h_final_d, final_xhat_d, final_invstd_d = self._norm_with_cache_gpu(
+                h_d, dw["final_ln_gamma"], fbeta,
+            )
+            cache["h_final_d"] = h_final_d
+            cache["final_xhat_d"] = final_xhat_d
+            cache["final_invstd_d"] = final_invstd_d
+            cache["stream"] = stream
+            if kv_arenas is not None:
+                cache["kv_arenas"] = kv_arenas
+
+            logits_d = layers.linear(
+                h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
+            )
+            cache["logits_d"] = logits_d
+            if need_host_logits:
+                logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
+                cache["logits"] = logits
+            else:
+                logits = np.empty((B, T, cfg.vocab_size), dtype=np.float32)
+            from model.cuda.fp16_storage import compress_cache_fp16, fp16_storage_enabled
+            if fp16_storage_enabled() and not self._grad_checkpoint and not stream:
+                compress_cache_fp16(cache)
+            return logits, cache
+
+        tok_emb = w["token_embedding"][token_ids_batch]  # [B, T, C]
+        if self._use_rope:
+            x0 = tok_emb.astype(np.float32).reshape(B * T, cfg.embedding_dim)
+        else:
+            pos_emb = w["position_embedding"][:T]  # [T, C]
+            x0 = (tok_emb + pos_emb).astype(np.float32).reshape(B * T, cfg.embedding_dim)
+
+        cache["x0"] = x0
+        cache["layers"] = []
+        h_d = cuda_ops.to_device(x0)
+
+        for layer in range(cfg.num_layers):
+            prefix = f"layer_{layer}"
+            layer_cache: Dict = {"B": B, "T": T}
+
+            ln1_in = cuda_ops.to_host(h_d)
+            beta1 = None if self._use_rmsnorm else b[f"{prefix}.ln1_beta"]
+            ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"] = self._norm_cache_host(
+                ln1_in, w[f"{prefix}.ln1_gamma"], beta1,
+            )
+            layer_cache["ln1_in"] = ln1_in
+
+            if self._use_rmsnorm:
+                ln1_out_d = cuda_ops.rmsnorm_with_cache(
+                    h_d, dw[f"{prefix}.ln1_gamma"],
+                )[0]
+            else:
+                ln1_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln1_gamma"], db[f"{prefix}.ln1_beta"])
+            attn_out_d, attn_cache = self._attention_forward_batch(
+                ln1_out_d, ln1_out, prefix, B, T, H, hd, scale, tracer=tracer,
+            )
+            layer_cache["attn"] = attn_cache
+            h_d = layers.add_residual(h_d, attn_out_d, scale=self._resid_scale())
+
+            ln2_in = cuda_ops.to_host(h_d)
+            beta2 = None if self._use_rmsnorm else b[f"{prefix}.ln2_beta"]
+            ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"] = self._norm_cache_host(
+                ln2_in, w[f"{prefix}.ln2_gamma"], beta2,
+            )
+            layer_cache["ln2_in"] = ln2_in
+
+            if self._use_rmsnorm:
+                ln2_out_d = cuda_ops.rmsnorm_with_cache(h_d, dw[f"{prefix}.ln2_gamma"])[0]
+            else:
+                ln2_out_d = layers.layernorm(h_d, dw[f"{prefix}.ln2_gamma"], db[f"{prefix}.ln2_beta"])
+            mlp_out_d, mlp_cache = self._mlp_forward_batch(ln2_out_d, ln2_out, prefix, tracer=tracer)
+            layer_cache["mlp"] = mlp_cache
+            h_d = layers.add_residual(h_d, mlp_out_d, scale=self._resid_scale())
+
+            if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+
+            cache["layers"].append(layer_cache)
+            self._eval_stream(h_d)
+
+        cache["h_pre_final_ln"] = cuda_ops.to_host(h_d)
+        fbeta = None if self._use_rmsnorm else b["final_ln_beta"]
+        cache["h_final"], cache["final_xhat"], cache["final_invstd"] = self._norm_cache_host(
+            cache["h_pre_final_ln"], w["final_ln_gamma"], fbeta,
+        )
+
+        if self._use_rmsnorm:
+            h_final_d = cuda_ops.rmsnorm_with_cache(h_d, dw["final_ln_gamma"])[0]
+        else:
+            h_final_d = layers.layernorm(h_d, dw["final_ln_gamma"], db["final_ln_beta"])
+        logits_d = layers.linear(h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head")
+        logits = cuda_ops.to_host(logits_d).reshape(B, T, cfg.vocab_size)
+        cache["logits"] = logits
+
+        return logits, cache
+
+    def forward(self, token_ids: np.ndarray, tracer: TraceContext = None) -> Tuple[np.ndarray, Dict]:
+        """Single-sequence forward (wraps forward_batch with B=1).
+
+        Returns logits shaped [T, V]. The cache stays in the batched contract
+        (``B=1``, ``T``, ``batched=True``) so ``backward`` / ``backward_batch_gpu``
+        share one representation with training and benches.
+        """
+        logits, cache = self.forward_batch(np.asarray(token_ids).reshape(1, -1), tracer=tracer)
+        return logits[0], cache
+
+    def _attention_forward_batch(
+        self, ln1_out_d, ln1_out_host: np.ndarray, prefix: str,
+        B: int, T: int, H: int, hd: int, scale: float, tracer: TraceContext = None,
+        pos_offset: int = 0,
+    ):
+        dw, db = self.params.device_weights, self.params.device_biases
+        rope_base = float(self.config.rope_base) if self._use_rope else None
+
+        if _USE_GPU_ATTENTION:
+            attn_concat_d, probs_d, q_h, k_h, v_h = cuda_ops.fused_causal_attention_from_qkv(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                B, T, H, hd, scale, tracer=tracer, name=f"{prefix}.qkv",
+                rope_base=rope_base, pos_offset=pos_offset,
+            )
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+            attn_cache = {
+                "ln1_out_d": ln1_out_d,
+                "k_d": k_h, "v_d": v_h,  # always keep for KV generate / rope decode
+                "scale": scale, "B": B, "T": T, "gpu": True, "heads_layout": True,
+                "use_rope": self._use_rope, "rope_base": rope_base, "pos_offset": pos_offset,
+            }
+            if self._grad_checkpoint:
+                # Drop Q / probs / concat (largest); recompute in backward. Keep K/V for generate.
+                attn_cache["checkpoint"] = True
+            else:
+                attn_cache.update({
+                    "q_d": q_h,
+                    "probs_d": probs_d, "attn_concat_d": attn_concat_d,
+                })
+        else:
+            qkv_d = layers.linear(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                tracer=tracer, name=f"{prefix}.qkv",
+            )
+            qkv = cuda_ops.to_host(qkv_d)
+            attn_concat, probs_h, q_h, k_h, v_h = _batched_attention_host(
+                qkv, B, T, H, hd, scale,
+            )
+            if self._use_rope:
+                q_h = _rope_np(q_h.reshape(B * H, T, hd), base=float(self.config.rope_base), pos_offset=pos_offset)
+                k_h = _rope_np(k_h.reshape(B * H, T, hd), base=float(self.config.rope_base), pos_offset=pos_offset)
+                q_h = q_h.reshape(B, H, T, hd)
+                k_h = k_h.reshape(B, H, T, hd)
+            attn_concat_d = cuda_ops.to_device(attn_concat)
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+            attn_cache = {
+                "ln1_out": ln1_out_host, "q_h": q_h, "k_h": k_h, "v_h": v_h,
+                "probs_h": probs_h, "attn_concat": attn_concat,
+                "causal_mask": np.triu(np.ones((T, T), dtype=bool), k=1),
+                "scale": scale, "B": B, "T": T,
+            }
+
+        if tracer is not None and tracer.trace_neurons and tracer.active_step:
+            tracer.dump_neurons(f"{prefix}.attn_out", cuda_ops.to_host(attn_out_d))
+
+        return attn_out_d, attn_cache
+
+    def _mlp_forward_batch(self, ln2_out_d, ln2_out_host: np.ndarray, prefix: str, tracer: TraceContext = None):
+        dw, db = self.params.device_weights, self.params.device_biases
+
+        hidden_d, act_d = cuda_ops.matmul_bias_gelu(
+            ln2_out_d, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"],
+            tracer=tracer, name=f"{prefix}.mlp_expand",
+        )
+        mlp_out_d = layers.linear(
+            act_d, dw[f"{prefix}.mlp_contract"], db[f"{prefix}.mlp_contract_bias"],
+            tracer=tracer, name=f"{prefix}.mlp_contract",
+        )
+
+        if tracer is not None and tracer.trace_neurons and tracer.active_step:
+            tracer.dump_neurons(f"{prefix}.mlp_out", cuda_ops.to_host(mlp_out_d))
+
+        if _GPU_TRAINING and ln2_out_host is None:
+            mlp_cache = {"ln2_out_d": ln2_out_d, "gpu": True}
+            if self._grad_checkpoint:
+                mlp_cache["checkpoint"] = True
+            else:
+                mlp_cache["hidden_d"] = hidden_d
+                mlp_cache["act_d"] = act_d
+        else:
+            mlp_cache = {
+                "ln2_out": ln2_out_host,
+                "hidden": cuda_ops.to_host(hidden_d),
+                "act": cuda_ops.to_host(act_d),
+            }
+        return mlp_out_d, mlp_cache
+
+    def _block_forward_gpu(
+        self, layer: int, h_d, B: int, T: int, H: int, hd: int, scale: float,
+        tracer: TraceContext = None, keep_cache: bool = True, kv_arena=None,
+    ):
+        """Self-contained pre-norm block: LN1, attn, resid+LN2, MLP, resid add."""
+        from model.cuda.kv_cache import pack_prefill_into_arena
+
+        prefix = f"layer_{layer}"
+        dw, db = self.params.device_weights, self.params.device_biases
+        layer_cache: Dict = {"B": B, "T": T, "gpu": True}
+
+        beta1 = None if self._use_rmsnorm else db.get(f"{prefix}.ln1_beta")
+        ln1_out_d, ln1_xhat_d, ln1_invstd_d = self._norm_with_cache_gpu(
+            h_d, dw[f"{prefix}.ln1_gamma"], beta1,
+        )
+        attn_out_d, attn_cache = self._attention_forward_batch(
+            ln1_out_d, None, prefix, B, T, H, hd, scale, tracer=tracer,
+        )
+        if kv_arena is not None and attn_cache.get("k_d") is not None:
+            pack_prefill_into_arena(
+                attn_cache["k_d"], attn_cache["v_d"], kv_arena,
+                batch_heads=B * H, seq_len=T,
+                max_len=int(self.config.max_len), head_dim=hd,
+            )
+
+        beta2 = None if self._use_rmsnorm else db.get(f"{prefix}.ln2_beta")
+        h_d, ln2_out_d, ln2_xhat_d, ln2_invstd_d = self._residual_norm_with_cache_gpu(
+            h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], beta2,
+        )
+        mlp_out_d, mlp_cache = self._mlp_forward_batch(
+            ln2_out_d, None, prefix, tracer=tracer,
+        )
+        h_d = layers.add_residual(h_d, mlp_out_d, scale=self._resid_scale())
+
+        if keep_cache:
+            layer_cache["ln1_out_d"] = ln1_out_d
+            layer_cache["ln1_xhat_d"] = ln1_xhat_d
+            layer_cache["ln1_invstd_d"] = ln1_invstd_d
+            layer_cache["attn"] = attn_cache
+            layer_cache["ln2_out_d"] = ln2_out_d
+            layer_cache["ln2_xhat_d"] = ln2_xhat_d
+            layer_cache["ln2_invstd_d"] = ln2_invstd_d
+            layer_cache["mlp"] = mlp_cache
+        if tracer is not None and tracer.trace_neurons and tracer.active_step:
+            tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+        return h_d, layer_cache
+
+    def _block_backward_gpu(self, layer: int, d_h, layer_cache: Dict, dw: Dict) -> Tuple[object, Dict]:
+        prefix = f"layer_{layer}"
+        grads: Dict = {}
+
+        d_mlp_out = self._scale_branch_grad(d_h)
+        d_resid1 = d_h
+        d_ln2_out, mlp_grads = self._mlp_backward_gpu(d_mlp_out, layer_cache["mlp"], prefix, dw)
+        grads.update(mlp_grads)
+        d_h_from_ln2, d_ln2_gamma, d_ln2_beta = self._norm_backward_gpu(
+            d_ln2_out, layer_cache["ln2_xhat_d"], layer_cache["ln2_invstd_d"],
+            dw[f"{prefix}.ln2_gamma"],
+        )
+        grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
+        if d_ln2_beta is not None:
+            grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+        d_h = cuda_ops.add_into(d_resid1, d_h_from_ln2)
+
+        d_attn_out = self._scale_branch_grad(d_h)
+        d_resid0 = d_h
+        d_ln1_out, attn_grads = self._attention_backward_batch_gpu(
+            d_attn_out, layer_cache["attn"], prefix, dw,
+        )
+        grads.update(attn_grads)
+        d_h_from_ln1, d_ln1_gamma, d_ln1_beta = self._norm_backward_gpu(
+            d_ln1_out, layer_cache["ln1_xhat_d"], layer_cache["ln1_invstd_d"],
+            dw[f"{prefix}.ln1_gamma"],
+        )
+        grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
+        if d_ln1_beta is not None:
+            grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+        d_h = cuda_ops.add_into(d_resid0, d_h_from_ln1)
+        self._eval_stream(d_h)
+        return d_h, grads
+
+    def _grads_to_host(self, grads: Dict) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        for key, val in grads.items():
+            if val is None:
+                continue
+            if hasattr(val, "gpudata") or type(val).__name__ in ("DeviceArray", "GPUArray"):
+                out[key] = np.ascontiguousarray(cuda_ops.to_host(val), dtype=np.float32)
+            else:
+                out[key] = np.ascontiguousarray(val, dtype=np.float32)
+        return out
+
+    # ------------------------------------------------------------------
+    # Backward (batched)
+    # ------------------------------------------------------------------
+
+    def backward(self, cache: Dict, dlogits) -> Dict:
+        """Accepts dlogits [T,V] or [B,T,V] (NumPy) or device logits grad."""
+        if cache.get("gpu") and _GPU_TRAINING:
+            return self.backward_batch_gpu(cache, dlogits)
+        if hasattr(dlogits, "get"):
+            dlogits = dlogits.get()
+        if dlogits.ndim == 2:
+            dlogits = dlogits.reshape(1, *dlogits.shape)
+        if not cache.get("batched"):
+            return self._backward_unbatched(cache, dlogits[0])
+        return self.backward_batch(cache, dlogits)
+
+    def backward_batch_gpu(self, cache: Dict, dlogits_d) -> Dict:
+        """Full backward on GPU. dlogits_d: [B*T, V] device array."""
+        from model.cuda.fp16_storage import expand_cache_fp32
+
+        expand_cache_fp32(cache)
+
+        cfg = self.config
+        dw, db = self.params.device_weights, self.params.device_biases
+        B, T = cache["B"], cache["T"]
+        C, V = cfg.embedding_dim, cfg.vocab_size
+        grads: Dict = {}
+
+        if not hasattr(dlogits_d, "get"):
+            dlogits_d = cuda_ops.to_device(np.asarray(dlogits_d, dtype=np.float32).reshape(B * T, V))
+
+        d_h, d_lm_head, d_lm_bias = cuda_ops.linear_backward(
+            dlogits_d, cache["h_final_d"], dw["lm_head"],
+        )
+        grads["lm_head_bias"] = d_lm_bias
+
+        d_h, d_final_gamma, d_final_beta = self._norm_backward_gpu(
+            d_h, cache["final_xhat_d"], cache["final_invstd_d"], dw["final_ln_gamma"],
+        )
+        grads["final_ln_gamma"] = d_final_gamma
+        if d_final_beta is not None:
+            grads["final_ln_beta"] = d_final_beta
+
+        stream = bool(cache.get("stream") or self._streaming)
+        H, hd = cfg.num_heads, cfg.head_dim
+        scale = 1.0 / np.sqrt(hd)
+        host_grads: Dict = {}
+
+        for layer in reversed(range(cfg.num_layers)):
+            if stream:
+                self.params.load_layer(layer)
+                dw = self.params.device_weights
+                h_in = cache["h_in_d"][layer]
+                _, layer_cache = self._block_forward_gpu(
+                    layer, h_in, B, T, H, hd, scale, keep_cache=True,
+                )
+            else:
+                layer_cache = cache["layers"][layer]
+            d_h, layer_grads = self._block_backward_gpu(layer, d_h, layer_cache, dw)
+            if stream:
+                host_grads.update(self._grads_to_host(layer_grads))
+                cuda_ops.eval_for_host(d_h)
+                self.params.unload_layer(layer)
+            else:
+                grads.update(layer_grads)
+
+        d_tok, d_pos = cuda_ops.embed_backward(
+            cache["ids"].astype(np.int32), d_h, cfg.vocab_size, C,
+            with_position=not self._use_rope,
+        )
+        if self.params.tie_embeddings:
+            d_tok_from_head = cuda_ops.transpose_2d(d_lm_head, name="tied_lm_head_dT")
+            cuda_ops.add_inplace(d_tok, d_tok_from_head)
+            grads["token_embedding"] = d_tok
+        else:
+            grads["lm_head"] = d_lm_head
+            grads["token_embedding"] = d_tok
+        if d_pos is not None:
+            grads["position_embedding"] = d_pos
+        if stream:
+            host_grads.update(self._grads_to_host(grads))
+            return host_grads
+        return grads
+
+    def _mlp_backward_gpu(self, d_mlp_out, mlp_cache: Dict, prefix: str, dw: Dict):
+        db = self.params.device_biases
+        ln2_out_d = mlp_cache["ln2_out_d"]
+        if mlp_cache.get("checkpoint") or "act_d" not in mlp_cache:
+            hidden_d, act_d = cuda_ops.matmul_bias_gelu(
+                ln2_out_d, dw[f"{prefix}.mlp_expand"], db[f"{prefix}.mlp_expand_bias"],
+                name=f"{prefix}.mlp_expand_recompute",
+            )
+        else:
+            act_d = mlp_cache["act_d"]
+            hidden_d = mlp_cache["hidden_d"]
+
+        d_act, d_contract, d_contract_b = cuda_ops.linear_backward(
+            d_mlp_out, act_d, dw[f"{prefix}.mlp_contract"],
+        )
+        d_hidden = cuda_ops.gelu_backward(hidden_d, d_act)
+        d_ln2_out, d_expand, d_expand_b = cuda_ops.linear_backward(
+            d_hidden, ln2_out_d, dw[f"{prefix}.mlp_expand"],
+        )
+        grads = {
+            f"{prefix}.mlp_contract": d_contract,
+            f"{prefix}.mlp_contract_bias": d_contract_b,
+            f"{prefix}.mlp_expand": d_expand,
+            f"{prefix}.mlp_expand_bias": d_expand_b,
+        }
+        return d_ln2_out, grads
+
+    def _attention_backward_batch_gpu(self, d_attn_out, attn_cache: Dict, prefix: str, dw: Dict):
+        B, T = attn_cache["B"], attn_cache["T"]
+        H, hd = self.config.num_heads, self.config.head_dim
+        C = H * hd
+        scale = attn_cache["scale"]
+        ln1_out_d = attn_cache["ln1_out_d"]
+        db = self.params.device_biases
+
+        if attn_cache.get("checkpoint") or "probs_d" not in attn_cache:
+            rope_base = attn_cache.get("rope_base")
+            pos_offset = int(attn_cache.get("pos_offset", 0))
+            attn_concat_d, probs_d, q_d, k_d, v_d = cuda_ops.fused_causal_attention_from_qkv(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                B, T, H, hd, scale, name=f"{prefix}.qkv_recompute",
+                rope_base=rope_base, pos_offset=pos_offset,
+            )
+            heads_layout = True
+        else:
+            q_d, k_d, v_d = attn_cache["q_d"], attn_cache["k_d"], attn_cache["v_d"]
+            probs_d = attn_cache["probs_d"]
+            attn_concat_d = attn_cache["attn_concat_d"]
+            heads_layout = bool(attn_cache.get("heads_layout"))
+
+        d_attn_out_flat = d_attn_out.reshape(B * T, C)
+        d_attn_concat, d_out_proj, d_out_bias = cuda_ops.linear_backward(
+            d_attn_out_flat, attn_concat_d, dw[f"{prefix}.attn_out_proj"],
+        )
+
+        d_q, d_k, d_v = cuda_ops.attention_backward_heads(
+            d_attn_concat, q_d, k_d, v_d, probs_d,
+            B, T, H, hd, scale,
+            heads_layout=heads_layout,
+        )
+        if attn_cache.get("use_rope") and heads_layout:
+            rope_base = float(attn_cache.get("rope_base") or self.config.rope_base)
+            pos_offset = int(attn_cache.get("pos_offset", 0))
+            cuda_ops.rope_apply_inplace(
+                d_q, batch_heads=B * H, seq_len=T, head_dim=hd,
+                base=rope_base, pos_offset=pos_offset, backward=True,
+            )
+            cuda_ops.rope_apply_inplace(
+                d_k, batch_heads=B * H, seq_len=T, head_dim=hd,
+                base=rope_base, pos_offset=pos_offset, backward=True,
+            )
+        if heads_layout:
+            d_qkv = cuda_ops.pack_qkv_from_heads(d_q, d_k, d_v, B, T, H, hd)
+        else:
+            d_qkv = cuda_ops.pack_qkv(d_q, d_k, d_v)
+
+        d_ln1_out, d_qkv_w, d_qkv_b = cuda_ops.linear_backward(
+            d_qkv, ln1_out_d, dw[f"{prefix}.qkv_proj"],
+        )
+
+        grads = {
+            f"{prefix}.attn_out_proj": d_out_proj,
+            f"{prefix}.attn_out_bias": d_out_bias,
+            f"{prefix}.qkv_proj": d_qkv_w,
+            f"{prefix}.qkv_bias": d_qkv_b,
+        }
+        return d_ln1_out, grads
+
+    def backward_batch(self, cache: Dict, dlogits: np.ndarray) -> Dict[str, np.ndarray]:
+        """dlogits: [B, T, V]. Weight grads are summed over the batch."""
+        cfg = self.config
+        w = self.params.weights
+        B, T = cache["B"], cache["T"]
+        C = cfg.embedding_dim
+        V = cfg.vocab_size
+        grads: Dict[str, np.ndarray] = {}
+
+        dlogits_flat = dlogits.reshape(B * T, V)
+        h_final = cache["h_final"]
+
+        d_lm_head = h_final.T @ dlogits_flat
+        d_lm_head_bias = np.sum(dlogits_flat, axis=0)
+        d_h_final = dlogits_flat @ w["lm_head"].T
+        grads["lm_head_bias"] = d_lm_head_bias
+        if not self.params.tie_embeddings:
+            grads["lm_head"] = d_lm_head
+
+        d_h, d_final_gamma, d_final_beta = self._norm_backward_host(
+            d_h_final, cache["final_xhat"], cache["final_invstd"], w["final_ln_gamma"],
+        )
+        grads["final_ln_gamma"] = d_final_gamma
+        if d_final_beta is not None:
+            grads["final_ln_beta"] = d_final_beta
+
+        for layer in reversed(range(cfg.num_layers)):
+            prefix = f"layer_{layer}"
+            layer_cache = cache["layers"][layer]
+
+            d_mlp_out = self._scale_branch_grad(d_h)
+            d_resid1 = d_h
+
+            d_ln2_out, d_mlp_grads = self._mlp_backward(d_mlp_out, layer_cache["mlp"], prefix, w)
+            grads.update(d_mlp_grads)
+
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = self._norm_backward_host(
+                d_ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"], w[f"{prefix}.ln2_gamma"],
+            )
+            grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
+            if d_ln2_beta is not None:
+                grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+
+            d_h = d_resid1 + d_h_from_ln2
+
+            d_attn_out = self._scale_branch_grad(d_h)
+            d_resid0 = d_h
+
+            d_ln1_out, d_attn_grads = self._attention_backward_batch(
+                d_attn_out, layer_cache["attn"], prefix, w,
+            )
+            grads.update(d_attn_grads)
+
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = self._norm_backward_host(
+                d_ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"], w[f"{prefix}.ln1_gamma"],
+            )
+            grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
+            if d_ln1_beta is not None:
+                grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+
+            d_h = d_resid0 + d_h_from_ln1
+
+        d_h = d_h.reshape(B, T, C)
+        d_token_embedding = np.zeros_like(w["token_embedding"])
+        for b in range(B):
+            np.add.at(d_token_embedding, cache["ids"][b], d_h[b])
+        if self.params.tie_embeddings:
+            d_token_embedding = d_token_embedding + d_lm_head.T
+        grads["token_embedding"] = d_token_embedding
+        if not self._use_rope and "position_embedding" in w:
+            d_position_embedding = np.zeros_like(w["position_embedding"])
+            for b in range(B):
+                d_position_embedding[:T] += d_h[b]
+            grads["position_embedding"] = d_position_embedding
+        return grads
+
+    def _attention_backward_batch(self, d_attn_out: np.ndarray, attn_cache: Dict, prefix: str, w: Dict):
+        B, T = attn_cache["B"], attn_cache["T"]
+        H, hd = self.config.num_heads, self.config.head_dim
+        C = H * hd
+        ln1_out = attn_cache["ln1_out"]
+        q_h, k_h, v_h = attn_cache["q_h"], attn_cache["k_h"], attn_cache["v_h"]
+        probs_h, scale = attn_cache["probs_h"], attn_cache["scale"]
+
+        d_attn_out_flat = d_attn_out.reshape(B * T, C)
+        attn_concat = attn_cache["attn_concat"]
+
+        d_out_proj = attn_concat.T @ d_attn_out_flat
+        d_out_bias = np.sum(d_attn_out_flat, axis=0)
+        d_attn_concat = d_attn_out_flat @ w[f"{prefix}.attn_out_proj"].T
+        d_head_out = d_attn_concat.reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+
+        d_q = np.zeros((B, T, C), dtype=np.float32)
+        d_k = np.zeros((B, T, C), dtype=np.float32)
+        d_v = np.zeros((B, T, C), dtype=np.float32)
+
+        for b in range(B):
+            for hidx in range(H):
+                probs = probs_h[b, hidx]
+                d_probs = d_head_out[b, hidx] @ v_h[b, hidx].T
+                d_v_h = probs.T @ d_head_out[b, hidx]
+
+                row_dot = np.sum(d_probs * probs, axis=-1, keepdims=True)
+                d_raw = probs * (d_probs - row_dot)
+                d_raw *= scale
+
+                d_q_h = d_raw @ k_h[b, hidx]
+                d_k_h = d_raw.T @ q_h[b, hidx]
+
+                cols = slice(hidx * hd, (hidx + 1) * hd)
+                d_q[b, :, cols] += d_q_h
+                d_k[b, :, cols] += d_k_h
+                d_v[b, :, cols] += d_v_h
+
+        d_qkv = np.concatenate([d_q, d_k, d_v], axis=-1).reshape(B * T, 3 * C)
+        d_qkv_w = ln1_out.T @ d_qkv
+        d_qkv_b = np.sum(d_qkv, axis=0)
+        d_ln1_out = d_qkv @ w[f"{prefix}.qkv_proj"].T
+
+        grads = {
+            f"{prefix}.attn_out_proj": d_out_proj,
+            f"{prefix}.attn_out_bias": d_out_bias,
+            f"{prefix}.qkv_proj": d_qkv_w,
+            f"{prefix}.qkv_bias": d_qkv_b,
+        }
+        return d_ln1_out, grads
+
+    def _backward_unbatched(self, cache: Dict, dlogits: np.ndarray) -> Dict[str, np.ndarray]:
+        """Legacy path for caches without batch metadata (q_h shape [H,T,hd])."""
+        cfg = self.config
+        w = self.params.weights
+        grads: Dict[str, np.ndarray] = {}
+
+        h_final = cache["h_final"]
+        d_lm_head = h_final.T @ dlogits
+        d_lm_head_bias = np.sum(dlogits, axis=0)
+        d_h_final = dlogits @ w["lm_head"].T
+        grads["lm_head_bias"] = d_lm_head_bias
+        if not self.params.tie_embeddings:
+            grads["lm_head"] = d_lm_head
+
+        d_h, d_final_gamma, d_final_beta = self._norm_backward_host(
+            d_h_final, cache["final_xhat"], cache["final_invstd"], w["final_ln_gamma"],
+        )
+        grads["final_ln_gamma"] = d_final_gamma
+        if d_final_beta is not None:
+            grads["final_ln_beta"] = d_final_beta
+
+        for layer in reversed(range(cfg.num_layers)):
+            prefix = f"layer_{layer}"
+            layer_cache = cache["layers"][layer]
+
+            d_mlp_out = self._scale_branch_grad(d_h)
+            d_resid1 = d_h
+
+            d_ln2_out, d_mlp_grads = self._mlp_backward(d_mlp_out, layer_cache["mlp"], prefix, w)
+            grads.update(d_mlp_grads)
+
+            d_h_from_ln2, d_ln2_gamma, d_ln2_beta = self._norm_backward_host(
+                d_ln2_out, layer_cache["ln2_xhat"], layer_cache["ln2_invstd"], w[f"{prefix}.ln2_gamma"],
+            )
+            grads[f"{prefix}.ln2_gamma"] = d_ln2_gamma
+            if d_ln2_beta is not None:
+                grads[f"{prefix}.ln2_beta"] = d_ln2_beta
+
+            d_h = d_resid1 + d_h_from_ln2
+
+            d_attn_out = self._scale_branch_grad(d_h)
+            d_resid0 = d_h
+
+            d_ln1_out, d_attn_grads = self._attention_backward(d_attn_out, layer_cache["attn"], prefix, w)
+            grads.update(d_attn_grads)
+
+            d_h_from_ln1, d_ln1_gamma, d_ln1_beta = self._norm_backward_host(
+                d_ln1_out, layer_cache["ln1_xhat"], layer_cache["ln1_invstd"], w[f"{prefix}.ln1_gamma"],
+            )
+            grads[f"{prefix}.ln1_gamma"] = d_ln1_gamma
+            if d_ln1_beta is not None:
+                grads[f"{prefix}.ln1_beta"] = d_ln1_beta
+
+            d_h = d_resid0 + d_h_from_ln1
+
+        T = len(cache["ids"])
+        d_token_embedding = np.zeros_like(w["token_embedding"])
+        np.add.at(d_token_embedding, cache["ids"], d_h)
+
+        if self.params.tie_embeddings:
+            d_token_embedding = d_token_embedding + d_lm_head.T
+        grads["token_embedding"] = d_token_embedding
+        if not self._use_rope and "position_embedding" in w:
+            d_position_embedding = np.zeros_like(w["position_embedding"])
+            d_position_embedding[:T] += d_h
+            grads["position_embedding"] = d_position_embedding
+        return grads
+
+    def _mlp_backward(self, d_mlp_out: np.ndarray, mlp_cache: Dict, prefix: str, w: Dict):
+        act, hidden, ln2_out = mlp_cache["act"], mlp_cache["hidden"], mlp_cache["ln2_out"]
+
+        d_contract_w = act.T @ d_mlp_out
+        d_contract_b = np.sum(d_mlp_out, axis=0)
+        d_act = d_mlp_out @ w[f"{prefix}.mlp_contract"].T
+
+        d_hidden = d_act * _gelu_grad(hidden)
+        d_expand_w = ln2_out.T @ d_hidden
+        d_expand_b = np.sum(d_hidden, axis=0)
+        d_ln2_out = d_hidden @ w[f"{prefix}.mlp_expand"].T
+
+        grads = {
+            f"{prefix}.mlp_contract": d_contract_w,
+            f"{prefix}.mlp_contract_bias": d_contract_b,
+            f"{prefix}.mlp_expand": d_expand_w,
+            f"{prefix}.mlp_expand_bias": d_expand_b,
+        }
+        return d_ln2_out, grads
+
+    def _attention_backward(self, d_attn_out: np.ndarray, attn_cache: Dict, prefix: str, w: Dict):
+        cfg = self.config
+        H, hd = cfg.num_heads, cfg.head_dim
+        ln1_out = attn_cache["ln1_out"]
+        q_h, k_h, v_h = attn_cache["q_h"], attn_cache["k_h"], attn_cache["v_h"]
+        probs_h, scale = attn_cache["probs_h"], attn_cache["scale"]
+        T, C = ln1_out.shape
+
+        attn_concat = attn_cache["attn_concat"]
+        d_out_proj = attn_concat.T @ d_attn_out
+        d_out_bias = np.sum(d_attn_out, axis=0)
+        d_attn_concat = d_attn_out @ w[f"{prefix}.attn_out_proj"].T
+
+        d_head_out = d_attn_concat.reshape(T, H, hd).transpose(1, 0, 2)  # [H,T,hd]
+
+        d_q_h = np.empty_like(q_h)
+        d_k_h = np.empty_like(k_h)
+        d_v_h = np.empty_like(v_h)
+
+        for hidx in range(H):
+            probs = probs_h[hidx]  # [T,T]
+            d_probs = d_head_out[hidx] @ v_h[hidx].T  # [T,T]
+            d_v_h[hidx] = probs.T @ d_head_out[hidx]
+
+            # softmax jacobian-vector product per row
+            row_dot = np.sum(d_probs * probs, axis=-1, keepdims=True)
+            d_raw = probs * (d_probs - row_dot)
+            d_raw *= scale
+
+            d_q_h[hidx] = d_raw @ k_h[hidx]
+            d_k_h[hidx] = d_raw.T @ q_h[hidx]
+
+        d_q = d_q_h.transpose(1, 0, 2).reshape(T, C)
+        d_k = d_k_h.transpose(1, 0, 2).reshape(T, C)
+        d_v = d_v_h.transpose(1, 0, 2).reshape(T, C)
+        d_qkv = np.concatenate([d_q, d_k, d_v], axis=-1)
+
+        d_qkv_w = ln1_out.T @ d_qkv
+        d_qkv_b = np.sum(d_qkv, axis=0)
+        d_ln1_out = d_qkv @ w[f"{prefix}.qkv_proj"].T
+
+        grads = {
+            f"{prefix}.attn_out_proj": d_out_proj,
+            f"{prefix}.attn_out_bias": d_out_bias,
+            f"{prefix}.qkv_proj": d_qkv_w,
+            f"{prefix}.qkv_bias": d_qkv_b,
+        }
+        return d_ln1_out, grads
+
+    # ------------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------------
+
+    def generate(
+        self,
+        prompt_ids: List[int],
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = None,
+        top_p: float = None,
+        tracer: TraceContext = None,
+        tokenizer=None,
+        rng: np.random.Generator = None,
+        use_kv_cache: bool = True,
+        use_cuda_graph: bool = False,
+        stop_strings: Optional[Sequence[str]] = None,
+        stop_ids: Optional[Sequence[int]] = None,
+    ) -> List[int]:
+        """Autoregressive sampling with temperature and optional top-k / top-p filters.
+
+        When ``use_kv_cache`` is True (default), prompt is prefilled once and each
+        new token is decoded incrementally against cached K/V (Stage 4: device
+        arenas when GPU path is live). Training path is untouched.
+
+        ``use_cuda_graph`` attempts stream capture/replay of a GPU decode step
+        (Stage 4.5). Stochastic top-p forces host sampling (eager). Status is
+        stored on ``self._cuda_graph_status``.
+
+        ``stop_strings`` truncates generation when a decoded suffix contains one
+        of the strings (requires ``tokenizer``). The matching stop text is dropped.
+
+        ``stop_ids`` stops before appending that token (the end-of-story id).
+        """
+        rng = rng or np.random.default_rng()
+        ids = list(prompt_ids)
+        prompt_len = len(ids)
+        stop_id_set = {int(i) for i in stop_ids} if stop_ids else set()
+        self._cuda_graph_status = None
+        if self._streaming:
+            use_cuda_graph = False
+        if not use_kv_cache:
+            return self._generate_no_kv(
+                ids, max_new_tokens, temperature, top_k, top_p, tracer, tokenizer, rng,
+                stop_strings=stop_strings, prompt_len=prompt_len, stop_ids=stop_id_set,
+            )
+
+        logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
+        # Device argmax/top-k only for near-greedy (graph-safe). Stochastic
+        # temperature / top-p stay on the host sampler.
+        use_device_sample = (
+            bool(kv_state.get("device"))
+            and (top_p is None or not (0.0 < float(top_p) < 1.0))
+            and float(temperature) <= 1e-5
+        )
+        if use_cuda_graph and kv_state.get("device") and (
+            top_p is None or not (0.0 < float(top_p) < 1.0)
+        ):
+            # Graph path uses deterministic device sample between replays.
+            use_device_sample = True
+
+        graph_exec = None
+        if use_cuda_graph and kv_state.get("device") and kv_state["T"] < self.config.max_len:
+            graph_exec = self._try_setup_decode_graph(kv_state, ids)
+
+        for step in range(max_new_tokens):
+            if tracer is not None:
+                tracer.update_step(step)
+
+            last_logits = logits[-1] if isinstance(logits, np.ndarray) else None
+            if tracer is not None and tokenizer is not None and last_logits is not None:
+                window = ids[-self.config.max_len :]
+                tracer.dump_tokens(window, tokenizer, label=f"generate step {step} (context)")
+                tracer.dump_logits(last_logits, tokenizer, label=f"generate step {step}")
+
+            if use_device_sample and hasattr(self, "_last_logits_d") and self._last_logits_d is not None:
+                next_id = self._sample_next_id_device(
+                    self._last_logits_d, temperature=temperature, top_k=top_k,
+                )
+            else:
+                if last_logits is None:
+                    last_logits = cuda_ops.to_host(self._last_logits_d).reshape(-1)
+                next_id = _sample_next_id(
+                    last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
+                )
+            if int(next_id) in stop_id_set:
+                break
+            ids.append(next_id)
+            ids, stopped = trim_generated_stop_strings(
+                ids, prompt_len, tokenizer, stop_strings,
+            )
+            if stopped:
+                break
+
+            if kv_state["T"] >= self.config.max_len:
+                logits, kv_state = self._prefill_kv(ids[-self.config.max_len :], tracer=tracer)
+                graph_exec = None
+                # Sliding-window re-prefill fills T==max_len; skip graph until room to decode.
+            elif graph_exec is not None and kv_state["T"] + 1 < self.config.max_len:
+                logits, kv_state = self._replay_decode_graph(graph_exec, next_id, kv_state)
+            else:
+                logits, kv_state = self._decode_kv(next_id, kv_state, tracer=tracer)
+        return ids
+
+    def _generate_no_kv(
+        self, ids, max_new_tokens, temperature, top_k, top_p, tracer, tokenizer, rng,
+        stop_strings=None, prompt_len=None, stop_ids=None,
+    ) -> List[int]:
+        """Legacy full-recompute generate (KV cache disabled)."""
+        prompt_len = len(ids) if prompt_len is None else int(prompt_len)
+        stop_id_set = set(stop_ids) if stop_ids else set()
+        for step in range(max_new_tokens):
+            if tracer is not None:
+                tracer.update_step(step)
+            window = ids[-self.config.max_len :]
+            logits, _ = self.forward(np.asarray(window), tracer=tracer)
+            last_logits = logits[-1]
+            if tracer is not None and tokenizer is not None:
+                tracer.dump_tokens(window, tokenizer, label=f"generate step {step} (context)")
+                tracer.dump_logits(last_logits, tokenizer, label=f"generate step {step}")
+            next_id = _sample_next_id(
+                last_logits, temperature=temperature, top_k=top_k, top_p=top_p, rng=rng,
+            )
+            if int(next_id) in stop_id_set:
+                break
+            ids.append(next_id)
+            ids, stopped = trim_generated_stop_strings(
+                ids, prompt_len, tokenizer, stop_strings,
+            )
+            if stopped:
+                break
+        return ids
+
+    def _extract_kv_state(self, cache: Dict) -> Dict:
+        """Pull per-layer K/V into generate-only state (device arenas when GPU)."""
+        if cache.get("kv_arenas"):
+            B = int(cache["B"])
+            T = int(cache["T"])
+            return {
+                "layers": cache["kv_arenas"],
+                "T": T,
+                "B": B,
+                "device": True,
+                "max_len": int(self.config.max_len),
+                "num_heads": int(self.config.num_heads),
+                "head_dim": int(self.config.head_dim),
+            }
+        if _GPU_TRAINING and _USE_GPU_ATTENTION and cache.get("gpu"):
+            from model.cuda.kv_cache import build_device_kv_state
+            return build_device_kv_state(
+                cache,
+                max_len=self.config.max_len,
+                num_heads=self.config.num_heads,
+                head_dim=self.config.head_dim,
+            )
+        H, hd = self.config.num_heads, self.config.head_dim
+        B = int(cache["B"])
+        T = int(cache["T"])
+        layers = []
+        for layer_cache in cache["layers"]:
+            attn = layer_cache["attn"]
+            if attn.get("gpu") and "k_d" in attn:
+                k = cuda_ops.to_host(attn["k_d"]).astype(np.float32, copy=False)
+                v = cuda_ops.to_host(attn["v_d"]).astype(np.float32, copy=False)
+            else:
+                k = attn["k_h"].reshape(B * H, T, hd).astype(np.float32, copy=False)
+                v = attn["v_h"].reshape(B * H, T, hd).astype(np.float32, copy=False)
+            layers.append({"k": np.ascontiguousarray(k), "v": np.ascontiguousarray(v)})
+        return {"layers": layers, "T": T, "B": B, "device": False}
+
+    def _prefill_kv(self, token_ids, tracer: TraceContext = None):
+        """Full forward over ``token_ids``; return (logits [T,V], kv_state)."""
+        prev = getattr(self, "_stream_pack_kv", False)
+        if self._streaming:
+            self._stream_pack_kv = True
+        try:
+            logits, cache = self.forward(np.asarray(token_ids, dtype=np.int64), tracer=tracer)
+        finally:
+            self._stream_pack_kv = prev
+        kv_state = self._extract_kv_state(cache)
+        # Keep last-row logits on device for Stage 4 sampling when possible.
+        if kv_state.get("device") and cache.get("gpu") and "logits_d" in cache:
+            logits_d = cache["logits_d"]
+            T = int(cache["T"])
+            # logits_d is [B*T, V]; take last row.
+            self._last_logits_d = cuda_ops.take_row(logits_d, T - 1)
+        else:
+            self._last_logits_d = None
+        return logits, kv_state
+
+    def _decode_embed_device(self, token_id: int, pos: int):
+        """Single-token embedding on device (RoPE: tokens only; else + pos row)."""
+        dw = self.params.device_weights
+        ids = np.asarray([[int(token_id)]], dtype=np.int32)
+        h_d = cuda_ops.embedding_lookup_tokens(ids, dw["token_embedding"], 1)
+        if not self._use_rope:
+            pos_row = cuda_ops.take_row(dw["position_embedding"], int(pos), keepdims=True)
+            h_d = cuda_ops.add_arrays(h_d, pos_row)
+        return h_d
+
+    def _decode_kv(self, token_id: int, kv_state: Dict, tracer: TraceContext = None):
+        """Incremental single-token forward appending to K/V caches.
+
+        Device path (Stage 4): arenas + decode attention + device embed.
+        Host path retained for bring-up / non-GPU fallback.
+        """
+        if kv_state.get("device"):
+            return self._decode_kv_device(token_id, kv_state, tracer=tracer)
+        return self._decode_kv_host(token_id, kv_state, tracer=tracer)
+
+    def _decode_kv_device(
+        self, token_id: int, kv_state: Dict, tracer: TraceContext = None,
+        return_host_logits: bool = True,
+    ):
+        """GPU-resident incremental decode against static KV arenas."""
+        from model.cuda.allocator import lifetime_allocator
+        from model.cuda.kv_cache import append_kv_row
+
+        cfg = self.config
+        dw = self.params.device_weights
+        db = self.params.device_biases
+        B, T_past = int(kv_state["B"]), int(kv_state["T"])
+        if B != 1:
+            raise ValueError("KV decode currently supports B=1 generate only")
+        H, hd = cfg.num_heads, cfg.head_dim
+        BH = B * H
+        max_len = int(kv_state["max_len"])
+        scale = 1.0 / np.sqrt(hd)
+        pos = T_past
+        if pos >= cfg.max_len:
+            raise ValueError("KV decode position exceeds max_len; caller should re-prefill")
+
+        h_d = self._decode_embed_device(int(token_id), pos)
+        h_final_d = None
+        stream = self._streaming
+        for layer in range(cfg.num_layers):
+            prefix = f"layer_{layer}"
+            arena = kv_state["layers"][layer]
+            if stream:
+                self.params.load_layer(layer)
+                dw = self.params.device_weights
+                db = self.params.device_biases
+
+            beta1 = None if self._use_rmsnorm else db.get(f"{prefix}.ln1_beta")
+            ln1_out_d, _, _ = self._norm_with_cache_gpu(
+                h_d, dw[f"{prefix}.ln1_gamma"], beta1,
+            )
+
+            q_i, k_i, v_i = cuda_ops.linear_qkv_split(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                tracer=tracer, name=f"{prefix}.qkv",
+            )
+            # Interleaved [1, C] -> heads [H, 1, hd]
+            q_h = cuda_ops.interleaved_to_heads(q_i, 1, 1, H, hd)
+            k_h = cuda_ops.interleaved_to_heads(k_i, 1, 1, H, hd)
+            v_h = cuda_ops.interleaved_to_heads(v_i, 1, 1, H, hd)
+            lifetime_allocator.release(q_i)
+            lifetime_allocator.release(k_i)
+            lifetime_allocator.release(v_i)
+
+            if self._use_rope:
+                cuda_ops.rope_apply_inplace(
+                    q_h, batch_heads=BH, seq_len=1, head_dim=hd,
+                    base=float(cfg.rope_base), pos_offset=pos,
+                )
+                cuda_ops.rope_apply_inplace(
+                    k_h, batch_heads=BH, seq_len=1, head_dim=hd,
+                    base=float(cfg.rope_base), pos_offset=pos,
+                )
+
+            # Flatten [H,1,hd] -> [H,hd] for append / decode kernels
+            k_flat = k_h.reshape(BH, hd)
+            v_flat = v_h.reshape(BH, hd)
+            q_flat = q_h.reshape(BH, hd)
+            append_kv_row(
+                k_flat, v_flat, arena,
+                batch_heads=BH, t=pos, max_len=max_len, head_dim=hd,
+            )
+            valid_len = pos + 1
+            attn_flat = cuda_ops.causal_mha_decode(
+                q_flat, arena["k_d"], arena["v_d"],
+                batch_heads=BH, max_len=max_len, valid_len=valid_len,
+                head_dim=hd, scale=scale,
+            )
+            attn_heads = attn_flat.reshape(BH, 1, hd)
+            attn_concat_d = cuda_ops.merge_heads(attn_heads, 1, 1, H, hd)
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+
+            beta2 = None if self._use_rmsnorm else db.get(f"{prefix}.ln2_beta")
+            h_d, ln2_out_d, _, _ = self._residual_norm_with_cache_gpu(
+                h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], beta2,
+            )
+            mlp_out_d, _ = self._mlp_forward_batch(ln2_out_d, None, prefix, tracer=tracer)
+            h_d = layers.add_residual(h_d, mlp_out_d, scale=self._resid_scale())
+
+            if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+
+            self._eval_stream(h_d)
+            if stream:
+                self.params.unload_layer(layer)
+
+        fbeta = None if self._use_rmsnorm else db.get("final_ln_beta")
+        h_final_d, _, _ = self._norm_with_cache_gpu(h_d, dw["final_ln_gamma"], fbeta)
+
+        logits_d = layers.linear(
+            h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
+        )
+        # Keep a contiguous 1-D view for device sampling.
+        self._last_logits_d = logits_d.ravel()
+        kv_state = dict(kv_state)
+        kv_state["T"] = T_past + 1
+        if return_host_logits:
+            logits = cuda_ops.to_host(logits_d).reshape(1, cfg.vocab_size)
+        else:
+            logits = None
+        return logits, kv_state
+
+    def _decode_kv_host(self, token_id: int, kv_state: Dict, tracer: TraceContext = None):
+        """Legacy host K/V incremental decode (NumPy attention)."""
+        cfg = self.config
+        dw = self.params.device_weights
+        db = self.params.device_biases
+        B, T_past = int(kv_state["B"]), int(kv_state["T"])
+        if B != 1:
+            raise ValueError("KV decode currently supports B=1 generate only")
+        H, hd = cfg.num_heads, cfg.head_dim
+        scale = 1.0 / np.sqrt(hd)
+        pos = T_past
+        if pos >= cfg.max_len:
+            raise ValueError("KV decode position exceeds max_len; caller should re-prefill")
+
+        tok_emb = cuda_ops.to_host(dw["token_embedding"])
+        if self._use_rope:
+            h = tok_emb[int(token_id)].astype(np.float32).reshape(1, cfg.embedding_dim)
+        else:
+            pos_emb = cuda_ops.to_host(dw["position_embedding"])
+            h = (tok_emb[int(token_id)] + pos_emb[pos]).astype(np.float32).reshape(1, cfg.embedding_dim)
+        h_d = cuda_ops.to_device(h)
+
+        new_layers = []
+        h_final_d = None
+        stream = self._streaming
+        for layer in range(cfg.num_layers):
+            prefix = f"layer_{layer}"
+            past = kv_state["layers"][layer]
+            if stream:
+                self.params.load_layer(layer)
+                dw = self.params.device_weights
+                db = self.params.device_biases
+
+            beta1 = None if self._use_rmsnorm else db.get(f"{prefix}.ln1_beta")
+            ln1_out_d, _, _ = self._norm_with_cache_gpu(
+                h_d, dw[f"{prefix}.ln1_gamma"], beta1,
+            )
+
+            q_i, k_i, v_i = cuda_ops.linear_qkv_split(
+                ln1_out_d, dw[f"{prefix}.qkv_proj"], db[f"{prefix}.qkv_bias"],
+                tracer=tracer, name=f"{prefix}.qkv",
+            )
+            q_h = _interleaved_to_heads_host(cuda_ops.to_host(q_i), 1, 1, H, hd)
+            k_new = _interleaved_to_heads_host(cuda_ops.to_host(k_i), 1, 1, H, hd)
+            v_new = _interleaved_to_heads_host(cuda_ops.to_host(v_i), 1, 1, H, hd)
+
+            if self._use_rope:
+                q_h = _rope_np(q_h, base=float(cfg.rope_base), pos_offset=pos)
+                k_new = _rope_np(k_new, base=float(cfg.rope_base), pos_offset=pos)
+
+            k_all = np.concatenate([past["k"], k_new], axis=1)
+            v_all = np.concatenate([past["v"], v_new], axis=1)
+            attn_heads = _causal_attention_decode_host(q_h, k_all, v_all, scale)
+            attn_concat_d = cuda_ops.to_device(_heads_to_interleaved_host(attn_heads, 1, 1, H, hd))
+            attn_out_d = layers.linear(
+                attn_concat_d, dw[f"{prefix}.attn_out_proj"], db[f"{prefix}.attn_out_bias"],
+                tracer=tracer, name=f"{prefix}.attn_out",
+            )
+
+            beta2 = None if self._use_rmsnorm else db.get(f"{prefix}.ln2_beta")
+            h_d, ln2_out_d, _, _ = self._residual_norm_with_cache_gpu(
+                h_d, attn_out_d, dw[f"{prefix}.ln2_gamma"], beta2,
+            )
+            mlp_out_d, _ = self._mlp_forward_batch(ln2_out_d, None, prefix, tracer=tracer)
+            h_d = layers.add_residual(h_d, mlp_out_d, scale=self._resid_scale())
+
+            if tracer is not None and tracer.trace_neurons and tracer.active_step:
+                tracer.dump_neurons(f"{prefix}.resid2_out", cuda_ops.to_host(h_d))
+
+            self._eval_stream(h_d)
+            if stream:
+                self.params.unload_layer(layer)
+            new_layers.append({"k": k_all, "v": v_all})
+
+        fbeta = None if self._use_rmsnorm else db.get("final_ln_beta")
+        h_final_d, _, _ = self._norm_with_cache_gpu(h_d, dw["final_ln_gamma"], fbeta)
+
+        logits_d = layers.linear(
+            h_final_d, dw["lm_head"], db["lm_head_bias"], tracer=tracer, name="lm_head",
+        )
+        self._last_logits_d = None
+        logits = cuda_ops.to_host(logits_d).reshape(1, cfg.vocab_size)
+        return logits, {"layers": new_layers, "T": T_past + 1, "B": B, "device": False}
+
+    def _sample_next_id_device(
+        self,
+        logits_d,
+        temperature: float = 1.0,
+        top_k: int = None,
+    ) -> int:
+        """Device argmax (+ optional top-k mask). Graph-safe; no top-p/RNG."""
+        idx_d = cuda_ops.sample_logits_device(
+            logits_d, temperature=temperature, top_k=top_k,
+        )
+        return int(idx_d.get()[0])
+
+    def _try_setup_decode_graph(self, kv_state: Dict, ids: List[int]):
+        """Warm + capture Stage 4 decode kernel chain for replay (Stage 4.5)."""
+        if self._streaming:
+            return None
+        from model.cuda.graph import try_capture_decode_replayable
+        from model.cuda.kv_cache import clone_device_kv_state
+
+        if int(kv_state.get("T", 0)) >= int(self.config.max_len):
+            return None
+
+        probe_token = int(ids[-1]) if ids else 0
+        kv_snap = clone_device_kv_state(kv_state)
+
+        def _probe_decode():
+            # No D2H during capture (Stage 4.5). Diagnostic only; kernel-chain is captured.
+            if int(kv_snap["T"]) >= int(self.config.max_len):
+                return
+            self._decode_kv_device(probe_token, kv_snap, tracer=None, return_host_logits=False)
+
+        status, graph = try_capture_decode_replayable(_probe_decode)
+        self._cuda_graph_status = status.to_dict() if hasattr(status, "to_dict") else status
+        if graph is None:
+            return None
+        return {"graph": graph, "token": probe_token}
+
+    def _replay_decode_graph(self, graph_exec: Dict, token_id: int, kv_state: Dict):
+        """Replay captured decode when possible; else eager device decode.
+
+        Kepler/CUDA 10 graphs bake launch params, so growing ``T`` usually requires
+        eager GPU decode after the first captured length. Capture still records
+        ``decode_capture.mode=graph`` when the probe body is sync-free.
+        """
+        return self._decode_kv_device(int(token_id), kv_state, tracer=None)
+
+def _squeeze_batch_cache(cache: Dict) -> Dict:
+    """Legacy helper: previously squeezed B=1 caches for single-seq consumers.
+
+    Stage 3.1 exit: batch cache (``B``, ``T``, ``batched=True``) is the stable
+    internal contract. ``forward()`` no longer calls this. Kept for any external
+    callers; GPU path no longer strips ``B``/``T``.
+    """
+    if cache.get("B", 1) != 1:
+        return cache
+    out = dict(cache)
+    # Keep B/T/batched for backward_batch_gpu / backward_batch.
+    out["batched"] = True
+    if cache.get("gpu"):
+        return out
+    # Host attention caches may still store per-batch head tensors [B,H,T,hd].
+    for layer_cache in out.get("layers", []):
+        attn = layer_cache.get("attn")
+        if not attn or "q_h" not in attn:
+            continue
+        if getattr(attn["q_h"], "ndim", 0) == 4 and attn["q_h"].shape[0] == 1:
+            attn["q_h"] = attn["q_h"][0]
+            attn["k_h"] = attn["k_h"][0]
+            attn["v_h"] = attn["v_h"][0]
+            attn["probs_h"] = attn["probs_h"][0]
+    return out
+
+
+def _softmax_1d(x: np.ndarray) -> np.ndarray:
+    shifted = x - np.max(x)
+    exp = np.exp(shifted)
+    return exp / np.sum(exp)
+
+
+def _sample_next_id(
+    logits: np.ndarray,
+    temperature: float = 1.0,
+    top_k: int = None,
+    top_p: float = None,
+    rng: np.random.Generator = None,
+) -> int:
+    """Temperature + optional top-k / nucleus (top-p) filtering, then multinomial sample."""
+    rng = rng or np.random.default_rng()
+    scaled = logits / max(temperature, 1e-6)
+    probs = _softmax_1d(scaled)
+
+    if top_k is not None and top_k > 0:
+        k = min(int(top_k), len(probs))
+        kth = np.partition(probs, -k)[-k]
+        probs = probs.copy()
+        probs[probs < kth] = 0.0
+
+    if top_p is not None and 0.0 < float(top_p) < 1.0:
+        probs = probs.copy()
+        order = np.argsort(probs)[::-1]
+        sorted_probs = probs[order]
+        cumulative = np.cumsum(sorted_probs)
+        # Drop mass past the nucleus; keep at least the highest-prob token.
+        remove = cumulative > float(top_p)
+        if np.any(remove):
+            remove[1:] = remove[:-1].copy()
+            remove[0] = False
+            probs[order[remove]] = 0.0
+
+    total = float(np.sum(probs))
+    if total <= 0.0:
+        probs = _softmax_1d(scaled)
+    else:
+        probs = probs / total
+
+    return int(rng.choice(len(probs), p=probs))

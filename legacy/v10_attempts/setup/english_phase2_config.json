@@ -1,0 +1,47 @@
+{
+  "model": {
+    "name": "english_phase2",
+    "vocab_size": null,
+    "max_len": 256,
+    "embedding_dim": 256,
+    "num_heads": 8,
+    "num_layers": 6,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "residual_scale": true,
+    "layer_strategy": "resident",
+    "description": "Phase 2 inject recipe snapshot. Architecture is frozen by English-Phase1 on --resume. C=256 L=6 H=8 T=256. Do not rebuild BPE. dropout_prob is unused. 2 GB cap hardcoded."
+  },
+  "dataset": {
+    "name": "english_phase2_mix",
+    "path": "data/english_phase2_mix.txt",
+    "combine": false,
+    "tokenizer": "bpe",
+    "bpe_merges": 4000,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "english_phase2",
+    "learning_rate": 0.00005,
+    "weight_decay": 0.01,
+    "batch_size": 4,
+    "num_epochs": 1,
+    "warmup_steps": 100,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 4,
+    "window_stride": 128,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08
+  },
+  "metadata": {
+    "created": "english-phase2-inject",
+    "description": "Continue English-Phase1 with data/english_phase2_mix.txt via train.py/auto_train.py --resume --dataset-path. Same BPE. --reset-lr-schedule required. Unguided will not resume this dir. Product chat stays chat_facts_v7. Do not combine data/*.txt. Do not --resume v7/v8/v9."
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "recipe": "setup/english_tinystories_c1024_l6_config.json",
+  "checkpoint_dir": "output/checkpoints/english_tinystories_c1024_l6",
+  "run_name": "english_tinystories_c1024_l6",
+  "max_steps": 4000,
+  "eval_every": 500,
+  "log_every": 25,
+  "max_wall_s": 259200,
+  "early_stop_patience": 100000,
+  "loss_spike_ratio": 2.0,
+  "loss_median_window": 5,
+  "promote_on": {
+    "metric": "val_loss",
+    "mode": "min"
+  },
+  "remix_if": {
+    "cabinet_exact_match_below": -1.0,
+    "after_steps": 999999,
+    "action": "abort_remix"
+  },
+  "probe_on_stop": true,
+  "probe_mode": "tinystories",
+  "probe_every": 2000,
+  "probe_n": 6,
+  "probe_ood": true,
+  "probe_seed": 42,
+  "hard_limits": {
+    "refuse_resume_on_vocab_mismatch": true,
+    "refuse_existing_v6_v4_dir": true,
+    "always_abort_on_nan": true,
+    "always_abort_on_spike": true
+  },
+  "unguarded_defaults": {
+    "skip_quarantine_on_next_mix": true,
+    "allow_overwrite_latest": true
+  }
+}

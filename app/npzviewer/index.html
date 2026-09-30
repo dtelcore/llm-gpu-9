@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NPZ Viewer</title>
+  <style>
+    :root {
+      --bg: #0b0b0f;
+      --side: #111217;
+      --panel: #18181f;
+      --border: #2a2a33;
+      --text: #ececf1;
+      --muted: #9a9aa8;
+      --accent: #8b5cf6;
+      --chip: #2e2e38;
+      --good: #34d399;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --embed: #93c5fd;
+      --attn: #c4b5fd;
+      --mlp: #6ee7b7;
+      --norm: #fcd34d;
+      --head: #f9a8d4;
+      --other: #cbd5e1;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+    .app { display: grid; grid-template-columns: 280px 1fr; height: 100%; }
+    aside { background: var(--side); border-right: 1px solid var(--border); padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+    aside h1 { font-size: 15px; margin: 0 0 4px; font-weight: 650; }
+    aside p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    button, input, select { font: inherit; }
+    .btn { background: var(--accent); color: white; border: 0; border-radius: 10px; padding: 8px 12px; cursor: pointer; font-weight: 600; }
+    .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); text-decoration: none; text-align: center; }
+    .pathbox { display: flex; gap: 6px; }
+    .pathbox input { flex: 1; min-width: 0; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }
+    #files { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+    .file { text-align: left; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; cursor: pointer; color: var(--text); }
+    .file.active { border-color: var(--accent); }
+    .file strong { display: block; font-size: 12px; }
+    .file span { font-size: 11px; color: var(--muted); }
+    main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+    header.top { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    header.top strong { font-size: 14px; }
+    header.top span { font-size: 12px; color: var(--muted); }
+    .scroll { flex: 1; overflow: auto; padding: 18px 20px 28px; display: flex; flex-direction: column; gap: 16px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; }
+    .card label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+    .card b { font-size: 16px; font-weight: 650; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip { background: var(--chip); border-radius: 999px; padding: 2px 8px; font-size: 11px; color: #c4b5fd; }
+    .chip.bad { color: var(--bad); }
+    .chip.warn { color: var(--warn); }
+    .chip.good { color: var(--good); }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .toolbar input, .toolbar select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 7px 8px; }
+    table.tensors { width: 100%; border-collapse: collapse; font-size: 12px; }
+    table.tensors th, table.tensors td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    table.tensors tbody tr { cursor: pointer; }
+    table.tensors tbody tr:hover, table.tensors tbody tr.active { background: #1f1f28; }
+    .fam { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+    .fam.embed { color: var(--embed); }
+    .fam.attn { color: var(--attn); }
+    .fam.mlp { color: var(--mlp); }
+    .fam.norm { color: var(--norm); }
+    .fam.head { color: var(--head); }
+    .fam.other { color: var(--other); }
+    .detail { display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
+    .detail.wide { grid-template-columns: 1fr; }
+    canvas { display: block; width: 100%; background: #101014; border: 1px solid var(--border); border-radius: 10px; }
+    .heatwrap canvas { height: 240px; }
+    .histwrap canvas { height: 120px; }
+    .matrix { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .matrix th, .matrix td { padding: 3px 5px; border: 1px solid var(--border); text-align: right; }
+    .matrix th.pick { cursor: pointer; }
+    .matrix th.picked, .matrix td.picked { outline: 1px solid var(--accent); }
+    table.partners { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+    table.partners th, table.partners td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+    table.partners tbody tr { cursor: pointer; }
+    table.partners tbody tr:hover { background: #1f1f28; }
+    .pos { color: var(--good); }
+    .neg { color: var(--bad); }
+    .muted { color: var(--muted); font-size: 12px; }
+    .err { color: var(--bad); }
+    .layerbars { display: flex; align-items: flex-end; gap: 4px; height: 72px; }
+    .layerbar { flex: 1; min-width: 8px; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; height: 100%; }
+    .layerbar i { display: block; border-radius: 2px 2px 0 0; }
+    .layerbar .attn { background: #7c3aed; }
+    .layerbar .mlp { background: #059669; }
+    h2 { font-size: 13px; margin: 0 0 8px; font-weight: 650; }
+    @media (max-width: 980px) {
+      .app { grid-template-columns: 1fr; }
+      aside { display: none; }
+      .detail { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <h1>NPZ Viewer</h1>
+      <p>Inspect .npz / .npy / .npx weights. Host mmap only — the GPT stays off Metal.</p>
+      <form class="pathbox" id="openform">
+        <input id="path" placeholder="output/checkpoints/.../weights.npz" />
+        <button class="btn" type="submit">Open</button>
+      </form>
+      <a class="btn ghost" id="chatlink" href="{{ chat_url }}" target="{{ '_self' if chat_url.startswith('/') else '_blank' }}" rel="noopener">Chat</a>
+      <label class="btn ghost" style="text-align:center">
+        Upload
+        <input id="upload" type="file" accept=".npz,.npy,.npx" hidden />
+      </label>
+      <div id="files"></div>
+    </aside>
+    <main>
+      <header class="top">
+        <div>
+          <strong id="title">No file open</strong>
+          <div><span id="subtitle">Choose a checkpoint or upload a weight file.</span></div>
+        </div>
+        <div class="chips" id="health"></div>
+      </header>
+      <div class="scroll" id="body"></div>
+    </main>
+  </div>
+  <script>
+    const apiBase = {{ api_base|default('', true)|tojson }};
+    const initial = new URLSearchParams(location.search).get("path") || {{ initial|tojson }};
+    const chatBase = {{ chat_base|tojson }};
+    const filesEl = document.getElementById("files");
+    const body = document.getElementById("body");
+    const title = document.getElementById("title");
+    const subtitle = document.getElementById("subtitle");
+    const health = document.getElementById("health");
+    const pathInput = document.getElementById("path");
+    let currentPath = "";
+    let manifest = null;
+    let selectedKey = "";
+    let picked = null;
+    let lastHeat = null;
+    let lastTable = null;
+
+    function fmtBytes(n) {
+      if (n == null) return "—";
+      if (n < 1024) return n + " B";
+      if (n < 1048576) return (n / 1024).toFixed(1) + " KiB";
+      return (n / 1048576).toFixed(1) + " MiB";
+    }
+    function fmtNum(n) {
+      if (n == null || Number.isNaN(n)) return "—";
+      const a = Math.abs(n);
+      if (a !== 0 && (a < 1e-3 || a >= 1e4)) return n.toExponential(3);
+      return n.toFixed(4);
+    }
+    function fmtInt(n) {
+      return n == null ? "—" : Number(n).toLocaleString();
+    }
+    function chip(text, cls) {
+      const el = document.createElement("span");
+      el.className = "chip" + (cls ? " " + cls : "");
+      el.textContent = text;
+      return el;
+    }
+    function card(label, value) {
+      return `<div class="card"><label>${label}</label><b>${value}</b></div>`;
+    }
+
+    async function loadFiles() {
+      const res = await fetch(apiBase + "/api/files");
+      const data = await res.json();
+      filesEl.innerHTML = "";
+      (data.files || []).forEach((file) => {
+        const btn = document.createElement("button");
+        btn.className = "file" + (file.path === currentPath ? " active" : "");
+        btn.type = "button";
+        btn.innerHTML = `<strong>${file.parent} / ${file.name}</strong><span>${file.kind} · ${fmtBytes(file.bytes)}</span>`;
+        btn.addEventListener("click", () => openPath(file.path));
+        filesEl.appendChild(btn);
+      });
+    }
+
+    function chatHref(path) {
+      if (!chatBase) return "http://127.0.0.1:7860/";
+      if (!path) return chatBase + "/";
+      let ck = path.replace(/\/?weights\.npz$/i, "").replace(/\/$/, "");
+      return chatBase + "/?checkpoint=" + encodeURIComponent(ck);
+    }
+
+    function syncPeer(path) {
+      const link = document.getElementById("chatlink");
+      if (link) link.href = chatHref(path);
+      const u = new URL(location.href);
+      if (path) u.searchParams.set("path", path);
+      else u.searchParams.delete("path");
+      history.replaceState({}, "", u);
+    }
+
+    async function openPath(path) {
+      currentPath = path;
+      pathInput.value = path;
+      syncPeer(path);
+      selectedKey = "";
+      title.textContent = path;
+      subtitle.textContent = "Reading mmap…";
+      health.innerHTML = "";
+      body.innerHTML = `<p class="muted">Loading ${path}</p>`;
+      await loadFiles();
+      const res = await fetch(apiBase + "/api/manifest?path=" + encodeURIComponent(path));
+      const data = await res.json();
+      if (!res.ok) {
+        body.innerHTML = `<p class="err">${data.error || "failed"}</p>`;
+        return;
+      }
+      manifest = data;
+      renderManifest();
+    }
+
+    function renderManifest() {
+      const a = manifest.architecture || {};
+      const side = manifest.sidecar || {};
+      const cfg = side.config || {};
+      title.textContent = manifest.path;
+      const bits = [
+        manifest.format,
+        fmtInt(manifest.params) + " values",
+        fmtBytes(manifest.bytes),
+        (manifest.tensors || []).length + " tensors",
+      ];
+      if (side.model_name) bits.unshift(side.model_name);
+      if (side.step != null) bits.push("step " + side.step);
+      subtitle.textContent = bits.join(" · ");
+      health.innerHTML = "";
+      const h = manifest.health || {};
+      health.appendChild(chip(h.ok ? "healthy" : "needs review", h.ok ? "good" : "bad"));
+      (h.flags || []).forEach((flag) => health.appendChild(chip(flag, flag === "exploding" || flag === "nan" || flag === "inf" ? "bad" : "warn")));
+      if (a.norm_type) health.appendChild(chip(a.norm_type));
+      if (a.pos_encoding) health.appendChild(chip(a.pos_encoding));
+      if (a.tie_embeddings) health.appendChild(chip("tied embeddings"));
+
+      const width = a.embedding_dim ?? cfg.embedding_dim;
+      const layers = a.num_layers ?? cfg.num_layers;
+      const vocab = a.vocab_size ?? cfg.vocab_size;
+      const heads = cfg.num_heads;
+      const cards = [
+        card("Width C", fmtInt(width)),
+        card("Layers L", fmtInt(layers)),
+        card("Vocab V", fmtInt(vocab)),
+        card("Heads", fmtInt(heads)),
+        card("MLP", a.mlp_multiplier != null ? a.mlp_multiplier + "×C" : "—"),
+        card("Norm", a.norm_type || "—"),
+        card("Position", a.pos_encoding || "—"),
+        card("Tied head", a.tie_embeddings ? "yes" : "no"),
+      ].join("");
+
+      const layerRows = manifest.layers || [];
+      const maxRms = Math.max(1e-12, ...layerRows.map((r) => Math.max(r.attn_rms || 0, r.mlp_rms || 0)));
+      const bars = layerRows.map((r) => {
+        const attn = Math.round(64 * ((r.attn_rms || 0) / maxRms));
+        const mlp = Math.round(64 * ((r.mlp_rms || 0) / maxRms));
+        return `<div class="layerbar" title="L${r.layer} attn ${fmtNum(r.attn_rms)} mlp ${fmtNum(r.mlp_rms)}"><i class="attn" style="height:${attn}px"></i><i class="mlp" style="height:${mlp}px"></i></div>`;
+      }).join("");
+
+      const mismatches = (manifest.mismatches || []).map((m) => `<span class="chip warn">${m}</span>`).join("");
+      const note = [
+        side.description ? `<p class="muted">${side.description}</p>` : "",
+        mismatches ? `<p class="chips">${mismatches}</p>` : "",
+      ].join("");
+      body.innerHTML = `
+        <div class="cards">${cards}</div>
+        ${note}
+        <div>
+          <h2>Per-layer RMS (purple attention, green MLP)</h2>
+          ${layerRows.length ? `<div class="layerbars">${bars}</div>` : `<p class="muted">No layer_* tensors in this file.</p>`}
+        </div>
+        <div class="toolbar">
+          <input id="filter" placeholder="Filter tensors" />
+          <select id="family">
+            <option value="">All families</option>
+            <option value="embed">embed</option>
+            <option value="attn">attn</option>
+            <option value="mlp">mlp</option>
+            <option value="norm">norm</option>
+            <option value="head">head</option>
+            <option value="other">other</option>
+          </select>
+        </div>
+        <table class="tensors">
+          <thead>
+            <tr><th>Tensor</th><th>Role</th><th>Shape</th><th>RMS</th><th>Mean</th><th>Flags</th></tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="detail"></div>
+      `;
+      document.getElementById("filter").addEventListener("input", renderRows);
+      document.getElementById("family").addEventListener("change", renderRows);
+      renderRows();
+      if (selectedKey) loadTensor(selectedKey);
+    }
+
+    function renderRows() {
+      const q = (document.getElementById("filter").value || "").toLowerCase();
+      const fam = document.getElementById("family").value;
+      const tbody = document.getElementById("rows");
+      tbody.innerHTML = "";
+      (manifest.tensors || []).forEach((t) => {
+        if (fam && t.family !== fam) return;
+        const hay = (t.key + " " + t.title + " " + t.family).toLowerCase();
+        if (q && !hay.includes(q)) return;
+        const tr = document.createElement("tr");
+        if (t.key === selectedKey) tr.className = "active";
+        tr.innerHTML = `
+          <td>${t.key}</td>
+          <td><span class="fam ${t.family}">${t.family}</span> ${t.title}</td>
+          <td>${(t.shape || []).join(" × ") || "scalar"}</td>
+          <td>${fmtNum(t.rms)}</td>
+          <td>${fmtNum(t.mean)}</td>
+          <td>${(t.flags || []).join(", ") || "—"}</td>
+        `;
+        tr.addEventListener("click", () => loadTensor(t.key));
+        tbody.appendChild(tr);
+      });
+    }
+
+    async function loadTensor(key, extras = {}) {
+      selectedKey = key;
+      renderRows();
+      const params = new URLSearchParams({ path: currentPath, key, ...extras });
+      const box = document.getElementById("detail");
+      box.innerHTML = `<p class="muted">Loading ${key}…</p>`;
+      const res = await fetch(apiBase + "/api/tensor?" + params.toString());
+      const data = await res.json();
+      if (!res.ok) {
+        box.innerHTML = `<p class="err">${data.error || "failed"}</p>`;
+        return;
+      }
+      const s = data.stats || {};
+      const table = data.table || {};
+      const heat = data.heatmap || {};
+      const hist = data.histogram || {};
+      const axisNeeded = (s.ndim || 0) >= 3;
+      const axes = data.axes || {};
+      const rowKind = axes.row_kind || "row";
+      const colKind = axes.col_kind || "col";
+      box.innerHTML = `
+        <div class="detail">
+          <div>
+            <h2>${data.title}</h2>
+            <p class="muted">${data.blurb}</p>
+            <div class="chips" style="margin:8px 0">
+              <span class="chip">${data.family}</span>
+              ${(data.flags || []).map((f) => `<span class="chip warn">${f}</span>`).join("")}
+            </div>
+            <div class="cards">
+              ${card("Shape", (s.shape || []).join(" × ") || "scalar")}
+              ${card("Dtype", s.dtype || "—")}
+              ${card("Min", fmtNum(s.min))}
+              ${card("Max", fmtNum(s.max))}
+              ${card("Mean", fmtNum(s.mean))}
+              ${card("Std", fmtNum(s.std))}
+              ${card("RMS", fmtNum(s.rms))}
+              ${card("|max|", fmtNum(s.abs_max))}
+            </div>
+            <div class="histwrap" style="margin-top:12px"><canvas id="hist"></canvas></div>
+            <h2 style="margin-top:16px">Pick a neuron</h2>
+            <p class="muted">Top-|weight| partners on this matrix. Click a row/column header or inspect an index.</p>
+            <div class="toolbar" style="margin-top:8px">
+              <select id="naxis">
+                <option value="row">${rowKind} (row)</option>
+                <option value="col">${colKind} (col)</option>
+              </select>
+              <input id="nindex" type="number" min="0" value="0" style="width:72px" />
+              <input id="nk" type="number" min="1" max="32" value="12" style="width:64px" title="top-k" />
+              <button class="btn" id="ninspect" type="button">Inspect</button>
+            </div>
+            <div id="partners"><p class="muted">No neuron selected.</p></div>
+          </div>
+          <div>
+            <div class="toolbar">
+              ${axisNeeded ? `Slice <input id="axis0" type="number" min="0" max="${data.axis0_max}" value="${data.axis0}" style="width:72px">` : ""}
+              Row <input id="row0" type="number" min="0" value="${table.row0 || 0}" style="width:72px">
+              Col <input id="col0" type="number" min="0" value="${table.col0 || 0}" style="width:72px">
+              <button class="btn ghost" id="slice" type="button">Show slice</button>
+            </div>
+            <div class="heatwrap" style="margin:10px 0"><canvas id="heat"></canvas></div>
+            <p class="muted">Heatmap is a block-mean preview. Table is the npzviewer-style numeric slice.</p>
+            <div style="overflow:auto; max-height:320px">
+              <table class="matrix" id="matrix"></table>
+            </div>
+          </div>
+        </div>
+      `;
+      lastHeat = heat;
+      lastTable = table;
+      drawHist(document.getElementById("hist"), hist);
+      drawHeat(document.getElementById("heat"), heat, picked && picked.key === key ? picked : null);
+      fillMatrix(document.getElementById("matrix"), table, heat, key);
+      const reload = () => loadTensor(key, {
+        axis0: document.getElementById("axis0") ? document.getElementById("axis0").value : 0,
+        row0: document.getElementById("row0").value,
+        col0: document.getElementById("col0").value,
+      });
+      document.getElementById("slice").addEventListener("click", reload);
+      document.getElementById("ninspect").addEventListener("click", () => {
+        inspectNeuron(key, document.getElementById("naxis").value, document.getElementById("nindex").value);
+      });
+      if (picked && picked.key === key) {
+        document.getElementById("naxis").value = picked.axis;
+        document.getElementById("nindex").value = picked.index;
+        renderPartners(picked);
+      }
+    }
+
+    function tableWindow() {
+      const t = lastTable || {};
+      return {
+        row0: Number(t.row0 || 0),
+        col0: Number(t.col0 || 0),
+        rows: Number(t.rows || 0),
+        cols: Number(t.cols || 0),
+      };
+    }
+
+    function inTableWindow(axis, index) {
+      const w = tableWindow();
+      if (axis === "row") return index >= w.row0 && index < w.row0 + Math.max(1, w.rows);
+      return index >= w.col0 && index < w.col0 + Math.max(1, w.cols);
+    }
+
+    function keepScroll(y) {
+      body.scrollTop = y;
+      window.scrollTo(0, y);
+      requestAnimationFrame(() => {
+        body.scrollTop = y;
+        window.scrollTo(0, y);
+      });
+    }
+
+    async function inspectNeuron(key, axis, index) {
+      const scroll = body.scrollTop || window.scrollY || 0;
+      const axis0 = document.getElementById("axis0") ? document.getElementById("axis0").value : 0;
+      const k = document.getElementById("nk") ? document.getElementById("nk").value : 12;
+      const params = new URLSearchParams({ path: currentPath, key, axis, index, k, axis0 });
+      const box = document.getElementById("partners");
+      if (box) box.innerHTML = `<p class="muted">Reading partners…</p>`;
+      const res = await fetch(apiBase + "/api/neuron?" + params.toString());
+      const data = await res.json();
+      if (!res.ok) {
+        if (box) box.innerHTML = `<p class="err">${data.error || "failed"}</p>`;
+        return;
+      }
+      picked = data;
+      const naxis = document.getElementById("naxis");
+      const nindex = document.getElementById("nindex");
+      if (naxis) naxis.value = data.axis;
+      if (nindex) nindex.value = String(data.index);
+      if (data.axis === "row") {
+        const rowEl = document.getElementById("row0");
+        if (rowEl) rowEl.value = data.index;
+      } else {
+        const colEl = document.getElementById("col0");
+        if (colEl) colEl.value = data.index;
+      }
+      renderPartners(data);
+      const heatCanvas = document.getElementById("heat");
+      if (heatCanvas && lastHeat) drawHeat(heatCanvas, lastHeat, data);
+      if (!inTableWindow(data.axis, data.index)) {
+        await refreshMatrixSlice(key, axis0);
+      } else if (lastTable) {
+        fillMatrix(document.getElementById("matrix"), lastTable, lastHeat || {}, key);
+      }
+      keepScroll(scroll);
+    }
+
+    async function refreshMatrixSlice(key, axis0) {
+      const scroll = body.scrollTop || window.scrollY || 0;
+      const row0 = document.getElementById("row0") ? document.getElementById("row0").value : 0;
+      const col0 = document.getElementById("col0") ? document.getElementById("col0").value : 0;
+      const params = new URLSearchParams({ path: currentPath, key, axis0, row0, col0 });
+      const res = await fetch(apiBase + "/api/tensor?" + params.toString());
+      const data = await res.json();
+      if (!res.ok || !data.table) return;
+      lastTable = data.table;
+      if (data.heatmap) lastHeat = data.heatmap;
+      fillMatrix(document.getElementById("matrix"), lastTable, lastHeat || {}, key);
+      keepScroll(scroll);
+    }
+
+    function renderPartners(data) {
+      const box = document.getElementById("partners");
+      if (!box) return;
+      const rows = (data.partners || []).map((p) => `
+        <tr data-axis="${p.axis}" data-index="${p.index}">
+          <td>${p.label}</td>
+          <td class="${p.weight >= 0 ? "pos" : "neg"}">${fmtNum(p.weight)}</td>
+          <td>${fmtNum(p.abs)}</td>
+        </tr>
+      `).join("");
+      box.innerHTML = `
+        <p class="muted">${data.label} on ${data.key} → top ${data.k} ${data.axis === "row" ? "columns" : "rows"}</p>
+        <table class="partners">
+          <thead><tr><th>Partner</th><th>Weight</th><th>|w|</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="3" class="muted">None</td></tr>`}</tbody>
+        </table>
+      `;
+      box.querySelectorAll("tbody tr[data-index]").forEach((tr) => {
+        tr.addEventListener("click", () => {
+          const axis = tr.getAttribute("data-axis");
+          const index = tr.getAttribute("data-index");
+          document.getElementById("naxis").value = axis;
+          document.getElementById("nindex").value = index;
+          inspectNeuron(data.key, axis, index);
+        });
+      });
+    }
+
+    function color(value, lo, hi) {
+      if (value == null || !Number.isFinite(value)) return "rgb(40,40,48)";
+      const t = hi === lo ? 0.5 : (value - lo) / (hi - lo);
+      const red = Math.round(255 * t);
+      const blue = Math.round(128 + (255 - red) / 2);
+      return `rgb(${red},128,${blue})`;
+    }
+
+    function drawHist(canvas, hist) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth * 2;
+      const h = canvas.height = 240;
+      ctx.fillStyle = "#101014";
+      ctx.fillRect(0, 0, w, h);
+      const counts = hist.counts || [];
+      const max = Math.max(1, ...counts);
+      const bw = w / Math.max(1, counts.length);
+      counts.forEach((c, i) => {
+        ctx.fillStyle = "#8b5cf6";
+        const bh = (c / max) * (h - 8);
+        ctx.fillRect(i * bw + 1, h - bh, Math.max(1, bw - 2), bh);
+      });
+    }
+
+    function drawHeat(canvas, heat, mark) {
+      const ctx = canvas.getContext("2d");
+      const w = canvas.width = canvas.clientWidth * 2;
+      const h = canvas.height = 480;
+      ctx.fillStyle = "#101014";
+      ctx.fillRect(0, 0, w, h);
+      const grid = heat.values || [];
+      if (!grid.length) return;
+      const rows = grid.length;
+      const cols = grid[0].length;
+      const cw = w / cols;
+      const ch = h / rows;
+      for (let i = 0; i < rows; i++) {
+        for (let j = 0; j < cols; j++) {
+          ctx.fillStyle = color(grid[i][j], heat.min, heat.max);
+          ctx.fillRect(j * cw, i * ch, cw + 0.5, ch + 0.5);
+        }
+      }
+      if (!mark) return;
+      const src = heat.source_shape || [];
+      const srcR = src[0] || rows;
+      const srcC = src[1] || cols;
+      ctx.strokeStyle = "#c4b5fd";
+      ctx.lineWidth = 3;
+      if (mark.axis === "row") {
+        const gy = Math.floor((mark.index * rows) / Math.max(1, srcR));
+        ctx.strokeRect(1, gy * ch + 1, w - 2, Math.max(2, ch - 2));
+      } else {
+        const gx = Math.floor((mark.index * cols) / Math.max(1, srcC));
+        ctx.strokeRect(gx * cw + 1, 1, Math.max(2, cw - 2), h - 2);
+      }
+    }
+
+    function fillMatrix(table, payload, heat, key) {
+      const values = payload.values || [];
+      const r0 = payload.row0 || 0;
+      const c0 = payload.col0 || 0;
+      const lo = heat.min;
+      const hi = heat.max;
+      let html = "<tr><th></th>";
+      if (values[0]) {
+        for (let j = 0; j < values[0].length; j++) {
+          const idx = c0 + j;
+          const on = picked && picked.key === key && picked.axis === "col" && picked.index === idx;
+          html += `<th class="pick${on ? " picked" : ""}" data-axis="col" data-index="${idx}">${idx}</th>`;
+        }
+      }
+      html += "</tr>";
+      values.forEach((row, i) => {
+        const ridx = r0 + i;
+        const onRow = picked && picked.key === key && picked.axis === "row" && picked.index === ridx;
+        html += `<tr><th class="pick${onRow ? " picked" : ""}" data-axis="row" data-index="${ridx}">${ridx}</th>`;
+        row.forEach((v) => {
+          html += `<td style="background:${color(v, lo, hi)}">${fmtNum(v)}</td>`;
+        });
+        html += "</tr>";
+      });
+      table.innerHTML = html;
+      table.querySelectorAll("th.pick").forEach((th) => {
+        th.addEventListener("click", () => {
+          inspectNeuron(key, th.getAttribute("data-axis"), th.getAttribute("data-index"));
+        });
+      });
+    }
+
+    document.getElementById("openform").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const path = pathInput.value.trim();
+      if (path) openPath(path);
+    });
+    document.getElementById("upload").addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const bodyForm = new FormData();
+      bodyForm.append("file", file);
+      const res = await fetch(apiBase + "/api/upload", { method: "POST", body: bodyForm });
+      const data = await res.json();
+      if (!res.ok) {
+        body.innerHTML = `<p class="err">${data.error || "upload failed"}</p>`;
+        return;
+      }
+      await loadFiles();
+      openPath(data.path);
+    });
+
+    loadFiles().then(() => {
+      if (initial) openPath(initial);
+    });
+  </script>
+</body>
+</html>

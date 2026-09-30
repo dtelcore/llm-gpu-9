@@ -1,0 +1,31 @@
+{
+  "poll_s": 30,
+  "min_retrain_queue_size": 5,
+  "max_retrain_queue_size": 40,
+  "retrain_queue_weight": 4,
+  "clean_anchor_weight": 3,
+  "broad_corpus_weight": 1,
+  "require_idle_app": true,
+  "loss_spike_ratio": 3.0,
+  "recipe": "legacy/setup/chat_facts_v7_config.json",
+  "policy": "legacy/setup/unguided_v7_policy.json",
+  "retrain_log": "output/cabinet_retrain.jsonl",
+  "status": "output/autotrainer_status.json",
+  "state": "output/autotrainer_state.json",
+  "metal_holder": "output/metal_holder.json",
+  "max_trains_per_hour": 2,
+  "crash_backoff_s": 300,
+  "backoff_max_s": 3600,
+  "max_gate_retries": 2,
+  "mix_jsonl": "data/chat_facts_unguided.jsonl",
+  "mix_txt": "data/chat_facts_unguided.txt",
+  "gate_anchors": [
+    "What is the capital of France?",
+    "Where is Paris?",
+    "What did William Cubitt invent?",
+    "Who invented penal treadmill?",
+    "What is sequential layer streaming?",
+    "How do I disable layer streaming?",
+    "How do I force layer streaming?"
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "model": {
+    "name": "Fast Stories (<1M)",
+    "vocab_size": null,
+    "max_len": 128,
+    "embedding_dim": 128,
+    "num_heads": 8,
+    "num_layers": 4,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "description": "Fast story model under 1M params. ~0.83M at BPE-256. batch=8, accum=2, seq=128."
+  },
+  "dataset": {
+    "name": "data_dir",
+    "combine": true,
+    "tokenizer": "bpe",
+    "bpe_merges": 200,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "Fast Stories Run",
+    "learning_rate": 0.0005,
+    "weight_decay": 0.01,
+    "batch_size": 8,
+    "num_epochs": 1,
+    "warmup_steps": 500,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 2,
+    "window_stride": 64,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-8
+  },
+  "metadata": {
+    "created": "story-sub1m",
+    "description": "Ready-to-run Fast Stories (<1M) config. Combines every data/*.txt file."
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "model": {
+    "name": "Tiny C=16 H=2 L=2 T=16",
+    "vocab_size": null,
+    "max_len": 16,
+    "embedding_dim": 16,
+    "num_heads": 2,
+    "num_layers": 2,
+    "dropout_prob": 0.0,
+    "tie_embeddings": true,
+    "norm_type": "rmsnorm",
+    "pos_encoding": "rope",
+    "init_scale": 0.02,
+    "residual_scale": false,
+    "layer_strategy": "resident",
+    "description": "Viewer smoke: 16 residual channels, 2 heads (RoPE head_dim=8), 2 layers, T=16. Trains only data/user_facts_tiny.jsonl. Do not --resume a larger chat checkpoint."
+  },
+  "dataset": {
+    "name": "user_facts_tiny",
+    "path": "data/user_facts_tiny.jsonl",
+    "combine": false,
+    "tokenizer": "bpe",
+    "bpe_merges": 200,
+    "vocab_size": null
+  },
+  "weight_initialization": {},
+  "hyperparameters": {
+    "name": "Tiny user_facts viewer",
+    "learning_rate": 0.001,
+    "weight_decay": 0.01,
+    "batch_size": 8,
+    "num_epochs": 1,
+    "warmup_steps": 5,
+    "gradient_clip": 1.0,
+    "gradient_accumulation_steps": 1,
+    "window_stride": 8,
+    "min_lr_ratio": 0.1,
+    "optimizer": "adamw",
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08
+  },
+  "metadata": {
+    "created": "user-facts-tiny-viewer",
+    "description": "C=16 T=16 H=2 L=2 from data/user_facts.txt only. H=16 is illegal here (RoPE needs even head_dim). Do not combine data/."
+  }
+}

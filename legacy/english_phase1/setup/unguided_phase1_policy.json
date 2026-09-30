@@ -1,0 +1,36 @@
+{
+  "recipe": "setup/english_phase1_config.json",
+  "checkpoint_dir": "output/checkpoints/English-Phase1",
+  "run_name": "English-Phase1",
+  "max_steps": 10000,
+  "eval_every": 50,
+  "log_every": 1,
+  "max_wall_s": 28800,
+  "early_stop_patience": 40,
+  "loss_spike_ratio": 2.0,
+  "loss_median_window": 5,
+  "promote_on": {
+    "metric": "val_loss",
+    "mode": "min"
+  },
+  "remix_if": {
+    "cabinet_exact_match_below": -1.0,
+    "after_steps": 999999,
+    "action": "abort_remix"
+  },
+  "probe_on_stop": true,
+  "probe_mode": "english",
+  "probe_n": 5,
+  "probe_ood": true,
+  "probe_seed": 42,
+  "hard_limits": {
+    "refuse_resume_on_vocab_mismatch": true,
+    "refuse_existing_v6_v4_dir": true,
+    "always_abort_on_nan": true,
+    "always_abort_on_spike": true
+  },
+  "unguarded_defaults": {
+    "skip_quarantine_on_next_mix": true,
+    "allow_overwrite_latest": true
+  }
+}

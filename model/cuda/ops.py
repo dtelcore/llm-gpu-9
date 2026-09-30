@@ -1,0 +1,1525 @@
+"""
+model/cuda/ops.py
+
+Host API wrapping the PyCUDA SourceModule. JIT targets the attached GPU (1660 Ti is sm_75).
+Handles environment bootstrap, compilation, grid/block sizing, and
+host<->device transfers. Import this module (not pycuda directly)
+from model code so the CUDA env is always configured first.
+"""
+
+import numpy as np
+
+from model.cuda import env as _env
+
+_env.configure()
+
+import pycuda.autoinit  # noqa: E402  (must follow env.configure())
+import pycuda.driver as cuda  # noqa: E402
+import pycuda.gpuarray as gpuarray  # noqa: E402
+from pycuda.compiler import SourceModule  # noqa: E402
+
+from logging_config import logger  # noqa: E402
+from model.cuda.kernels import CUDA_SOURCE  # noqa: E402
+
+# Driver used (total-free) just after context init, before our SourceModule /
+# model allocs — so process_used later excludes HDMI/display + foreign VRAM.
+_free0, _total0 = cuda.mem_get_info()
+_baseline_driver_used = int(_total0 - _free0)
+
+_mod = SourceModule(CUDA_SOURCE, options=_env.NVCC_OPTIONS)
+
+TILE_SIZE = 16  # shared-memory tiled GEMM (sm_35 / GT 730)
+_gemm_kernel = _mod.get_function("gemm_fp32")
+_add_bias_kernel = _mod.get_function("add_bias_fp32")
+_layernorm_kernel = _mod.get_function("layernorm_fp32")
+_residual_layernorm_cache_kernel = _mod.get_function("residual_layernorm_cache_fp32")
+_add_into_kernel = _mod.get_function("add_into_fp32")
+_gelu_kernel = _mod.get_function("gelu_fp32")
+_softmax_kernel = _mod.get_function("softmax_fp32")
+_add_kernel = _mod.get_function("add_fp32")
+_causal_mha_kernel = _mod.get_function("causal_mha_fp32")
+_split_qkv_kernel = _mod.get_function("split_qkv_fp32")
+_cross_entropy_kernel = _mod.get_function("cross_entropy_fp32")
+_gelu_backward_kernel = _mod.get_function("gelu_backward_fp32")
+_layernorm_cache_kernel = _mod.get_function("layernorm_cache_fp32")
+_layernorm_backward_kernel = _mod.get_function("layernorm_backward_fp32")
+_rmsnorm_kernel = _mod.get_function("rmsnorm_fp32")
+_rmsnorm_cache_kernel = _mod.get_function("rmsnorm_cache_fp32")
+_residual_rmsnorm_cache_kernel = _mod.get_function("residual_rmsnorm_cache_fp32")
+_rmsnorm_backward_kernel = _mod.get_function("rmsnorm_backward_fp32")
+_embed_backward_kernel = _mod.get_function("embed_backward_fp32")
+_pos_embed_backward_kernel = _mod.get_function("pos_embed_backward_fp32")
+_embed_forward_kernel = _mod.get_function("embed_forward_fp32")
+_embed_tokens_kernel = _mod.get_function("embed_tokens_fp32")
+_rope_apply_kernel = _mod.get_function("rope_apply_fp32")
+_scal_mul_kernel = _mod.get_function("scal_mul_fp32")
+_adamw_update_kernel = _mod.get_function("adamw_update_fp32")
+_softmax_backward_kernel = _mod.get_function("softmax_backward_fp32")
+_add_block_kernel = _mod.get_function("add_block_fp32")
+_grad_norm_contrib_kernel = _mod.get_function("grad_norm_contrib_fp32")
+_add_inplace_kernel = _mod.get_function("add_inplace_fp32")
+_interleaved_to_heads_kernel = _mod.get_function("interleaved_to_heads")
+_merge_heads_kernel = _mod.get_function("merge_heads_kernel")
+_pack_qkv_kernel = _mod.get_function("pack_qkv_fp32")
+_matmul_score_kernel = _mod.get_function("matmul_score_kernel")
+_softmax_fused_backward_kernel = _mod.get_function("softmax_fused_backward")
+_matmul_grad_q_kernel = _mod.get_function("matmul_grad_q_kernel")
+_matmul_grad_k_kernel = _mod.get_function("matmul_grad_k_kernel")
+_matmul_grad_v_kernel = _mod.get_function("matmul_grad_v")
+_gemm_batched_kernel = _mod.get_function("gemm_batched_fp32")
+_reduce_sum_axis0_kernel = _mod.get_function("reduce_sum_axis0_fp32")
+_transpose_2d_kernel = _mod.get_function("transpose_2d_fp32")
+_gemm_bias_kernel = _mod.get_function("gemm_bias_fp32")
+_split_heads_kernel = _mod.get_function("split_heads_kernel")
+_merge_heads_qkv_kernel = _mod.get_function("merge_heads_qkv_kernel")
+_fused_attn_fwd_kernel = _mod.get_function("fused_attention_forward_kernel")
+_gemm_bias_qkv_split_kernel = _mod.get_function("gemm_bias_qkv_split_fp32")
+_gemm_bias_gelu_kernel = _mod.get_function("gemm_bias_gelu_fp32")
+_fused_mlp_row_kernel = _mod.get_function("fused_mlp_row_fp32")
+_adamw_update_batched_kernel = _mod.get_function("adamw_update_batched_fp32")
+_float_to_half_kernel = _mod.get_function("float_to_half_kernel")
+_half_to_float_kernel = _mod.get_function("half_to_float_kernel")
+_kv_pack_prefill_kernel = _mod.get_function("kv_pack_prefill_fp32")
+_kv_append_row_kernel = _mod.get_function("kv_append_row_fp32")
+_causal_mha_decode_kernel = _mod.get_function("causal_mha_decode_fp32")
+_argmax_1d_kernel = _mod.get_function("argmax_1d_fp32")
+_topk_mask_kernel = _mod.get_function("topk_mask_inplace_fp32")
+
+_dev = cuda.Device(0)
+_cc = _dev.compute_capability()
+logger.info(
+    "PyCUDA kernels compiled for %s (CC %s.%s)",
+    _dev.name(),
+    _cc[0],
+    _cc[1],
+)
+
+MAX_THREADS_PER_BLOCK = 1024
+
+
+class ScratchPool:
+    """Reusable GPU buffers to cut repeated empty() and HtoD zeros.
+
+    Use a unique ``name`` when two same-shaped buffers must coexist
+    (e.g. d_probs vs d_raw). Do **not** pool tensors that outlive the
+    call and are stored in grad dicts or forward caches unless each has
+    a distinct stable name.
+
+    When ``memory_timeline`` is enabled (opt-in), records alloc/reuse/clear
+    events for pool-lifetime visualization — not per-tensor free timing.
+    """
+
+    def __init__(self):
+        self._buffers = {}
+
+    def get(self, shape, dtype=np.float32, zero=False, name=None):
+        from tools.tracing.runtime_metrics import memory_timeline
+
+        key = (tuple(int(s) for s in shape), np.dtype(dtype).str, name)
+        buf = self._buffers.get(key)
+        shape_t = tuple(int(s) for s in shape)
+        if buf is None or buf.shape != shape_t:
+            buf = gpuarray.empty(shape, dtype=dtype)
+            self._buffers[key] = buf
+            if memory_timeline.enabled:
+                free_b, total_b = cuda.mem_get_info()
+                memory_timeline.record_alloc(
+                    name, shape_t, int(buf.nbytes), key,
+                    driver_free=int(free_b), driver_total=int(total_b),
+                )
+        else:
+            if memory_timeline.enabled:
+                memory_timeline.record_reuse(name, shape_t, int(buf.nbytes))
+        if zero:
+            cuda.memset_d8(buf.gpudata, 0, buf.nbytes)
+        return buf
+
+    def clear(self):
+        from tools.tracing.runtime_metrics import memory_timeline
+
+        self._buffers.clear()
+        if memory_timeline.enabled:
+            memory_timeline.record_clear()
+
+    def resident_bytes(self) -> int:
+        return int(sum(int(b.nbytes) for b in self._buffers.values()))
+
+
+scratch_pool = ScratchPool()
+
+
+def _launch_1d(n: int, threads: int = 256):
+    return (int(np.ceil(n / threads)), 1, 1), (threads, 1, 1)
+
+
+def get_memory_info():
+    # type: () -> tuple
+    """Return (free_bytes, total_bytes) of GPU VRAM, straight from the driver."""
+    free_bytes, total_bytes = cuda.mem_get_info()
+    return free_bytes, total_bytes
+
+
+def _nvml_process_used_bytes():
+    """Return this PID's usedGpuMemory via NVML, or None if unavailable."""
+    try:
+        import ctypes
+        import os
+
+        nvml = ctypes.WinDLL("nvml.dll")
+    except Exception:
+        return None
+
+    NVML_SUCCESS = 0
+
+    class nvmlProcessInfo_t(ctypes.Structure):
+        _fields_ = [
+            ("pid", ctypes.c_uint),
+            ("usedGpuMemory", ctypes.c_ulonglong),
+        ]
+
+    try:
+        if nvml.nvmlInit() != NVML_SUCCESS:
+            return None
+        handle = ctypes.c_void_p()
+        if nvml.nvmlDeviceGetHandleByIndex(0, ctypes.byref(handle)) != NVML_SUCCESS:
+            nvml.nvmlShutdown()
+            return None
+        count = ctypes.c_uint(64)
+        infos = (nvmlProcessInfo_t * 64)()
+        # Prefer v2/v3 if present; fall back to original.
+        getter = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses_v3", None)
+        if getter is None:
+            getter = getattr(nvml, "nvmlDeviceGetComputeRunningProcesses_v2", None)
+        if getter is None:
+            getter = nvml.nvmlDeviceGetComputeRunningProcesses
+        rc = getter(handle, ctypes.byref(count), infos)
+        my_pid = os.getpid()
+        used = None
+        if rc == NVML_SUCCESS:
+            for i in range(int(count.value)):
+                if int(infos[i].pid) == my_pid:
+                    used = int(infos[i].usedGpuMemory)
+                    break
+        nvml.nvmlShutdown()
+        return used
+    except Exception:
+        try:
+            nvml.nvmlShutdown()
+        except Exception:
+            pass
+        return None
+
+
+def reset_memory_baseline():
+    """Re-arm process VRAM baseline from current driver used (total - free)."""
+    global _baseline_driver_used
+    free_b, total_b = cuda.mem_get_info()
+    _baseline_driver_used = int(total_b - free_b)
+    return _baseline_driver_used
+
+
+def get_memory_usage():
+    """Process-attributed VRAM plus driver capacity.
+
+    ``process_used_bytes`` excludes steady display/HDMI reservation when using
+    the baseline method (driver used just after context init, before our
+    SourceModule, is subtracted). Prefers NVML per-PID ``usedGpuMemory`` when
+    ``nvml.dll`` loads.
+
+    Returns dict with: process_used_bytes, driver_free_bytes, driver_total_bytes,
+    driver_used_bytes, source ('nvml'|'baseline').
+    """
+    global _baseline_driver_used
+    free_b, total_b = cuda.mem_get_info()
+    driver_used = int(total_b - free_b)
+    nvml_used = _nvml_process_used_bytes()
+    if nvml_used is not None:
+        return {
+            "process_used_bytes": int(nvml_used),
+            "driver_free_bytes": int(free_b),
+            "driver_total_bytes": int(total_b),
+            "driver_used_bytes": driver_used,
+            "source": "nvml",
+        }
+    if _baseline_driver_used is None:
+        _baseline_driver_used = driver_used
+    process_used = max(0, driver_used - int(_baseline_driver_used))
+    return {
+        "process_used_bytes": int(process_used),
+        "driver_free_bytes": int(free_b),
+        "driver_total_bytes": int(total_b),
+        "driver_used_bytes": driver_used,
+        "source": "baseline",
+    }
+
+
+def process_used_mb():
+    """Convenience: process-only used VRAM in MiB."""
+    return get_memory_usage()["process_used_bytes"] / (1024.0 ** 2)
+
+
+def next_pow2(n: int, cap: int = MAX_THREADS_PER_BLOCK) -> int:
+    """Smallest power of two >= n, capped at `cap`. Minimum 32 (one warp)."""
+    p = 32
+    while p < n and p < cap:
+        p *= 2
+    return min(p, cap)
+
+
+def to_device(arr: np.ndarray) -> gpuarray.GPUArray:
+    """Upload a NumPy float32 array to the device."""
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    host = np.ascontiguousarray(arr, dtype=np.float32)
+    if not runtime_metrics.enabled:
+        return gpuarray.to_gpu(host)
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_device"):
+        out = gpuarray.to_gpu(host)
+        cuda.Context.synchronize()
+    return out
+
+
+def to_host(arr: gpuarray.GPUArray) -> np.ndarray:
+    """Download a device array to NumPy."""
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    if not runtime_metrics.enabled:
+        return arr.get()
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_host"):
+        out = arr.get()
+        cuda.Context.synchronize()
+    return out
+
+
+def to_device_int64(arr: np.ndarray) -> gpuarray.GPUArray:
+    """Upload an int64 NumPy array to the device (offsets tables etc.)."""
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    host = np.ascontiguousarray(arr, dtype=np.int64)
+    if not runtime_metrics.enabled:
+        return gpuarray.to_gpu(host)
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_device"):
+        out = gpuarray.to_gpu(host)
+        cuda.Context.synchronize()
+    return out
+
+
+def float_to_half(arr: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Device cast float32 → float16 (FP16 storage; no host round-trip)."""
+    if arr.dtype == np.float16:
+        return arr
+    if arr.dtype != np.float32:
+        raise TypeError(f"float_to_half expects float32, got {arr.dtype}")
+    n = int(arr.size)
+    out = gpuarray.empty(arr.shape, dtype=np.float16)
+    if n == 0:
+        return out
+    grid, block = _launch_1d(n)
+    _float_to_half_kernel(
+        arr, out, np.int32(n), block=block, grid=grid,
+    )
+    return out
+
+
+def half_to_float(arr: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Device cast float16 → float32 for existing FP32 compute kernels."""
+    if arr.dtype == np.float32:
+        return arr
+    if arr.dtype != np.float16:
+        raise TypeError(f"half_to_float expects float16, got {arr.dtype}")
+    n = int(arr.size)
+    out = gpuarray.empty(arr.shape, dtype=np.float32)
+    if n == 0:
+        return out
+    grid, block = _launch_1d(n)
+    _half_to_float_kernel(
+        arr, out, np.int32(n), block=block, grid=grid,
+    )
+    return out
+
+
+def to_device_ptrs(gpudata_list) -> gpuarray.GPUArray:
+    """Upload a list of device pointers (from gpuarray.gpudata) as uint64."""
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    ptrs = np.array([int(p) for p in gpudata_list], dtype=np.uint64)
+    if not runtime_metrics.enabled:
+        return gpuarray.to_gpu(ptrs)
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_device"):
+        out = gpuarray.to_gpu(ptrs)
+        cuda.Context.synchronize()
+    return out
+
+
+def eval_for_host(*arrays) -> None:
+    """Kernels are eager. Sync before a host read of these arrays."""
+    if any(a is not None for a in arrays):
+        cuda.Context.synchronize()
+
+
+def take_row(arr: gpuarray.GPUArray, index: int, keepdims: bool = False) -> gpuarray.GPUArray:
+    """Copy one row of a 2-D device array."""
+    src = arr[int(index)]
+    n = int(src.size)
+    out_shape = (1, n) if keepdims else (n,)
+    out = gpuarray.empty(out_shape, dtype=arr.dtype)
+    cuda.memcpy_dtod(out.gpudata, src.gpudata, n * arr.dtype.itemsize)
+    return out
+
+
+def scale_const(arr: gpuarray.GPUArray, scale: float) -> gpuarray.GPUArray:
+    """Return ``scale * arr`` without mutating ``arr`` when scale is not 1."""
+    if float(scale) == 1.0:
+        return arr
+    return scal_mul(arr.copy(), float(scale))
+
+
+def add_arrays(a: gpuarray.GPUArray, b: gpuarray.GPUArray, scale: float = 1.0) -> gpuarray.GPUArray:
+    """Elementwise ``a + scale * b`` for same-shaped device arrays."""
+    if float(scale) != 1.0:
+        b = scale_const(b, scale)
+    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
+    n_elements = np.int32(a.size)
+    out = gpuarray.empty_like(a)
+    threads = 256
+    blocks = int(np.ceil(int(n_elements) / threads))
+    _add_kernel(a, b, out, n_elements, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return out
+
+
+def add_into(a: gpuarray.GPUArray, b: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """In-place a += b (same shape). Returns a."""
+    assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
+    n = np.int32(a.size)
+    threads = 256
+    blocks = int(np.ceil(int(n) / threads))
+    _add_into_kernel(a, b, n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return a
+
+
+def matmul(A: gpuarray.GPUArray, B: gpuarray.GPUArray, tracer=None, name: str = "gemm") -> gpuarray.GPUArray:
+    """C = A @ B for 2D float32 device arrays.
+
+    Non-contiguous ``.T`` views are materialized with a transpose kernel, then
+    multiplied with the contiguous gemm (strided gemm is TDR-slow on Kepler).
+    """
+    assert A.ndim == 2 and B.ndim == 2, f"matmul expects 2D, got {A.shape} @ {B.shape}"
+    M, Ka = int(A.shape[0]), int(A.shape[1])
+    Kb, N = int(B.shape[0]), int(B.shape[1])
+    assert Ka == Kb, f"Shape mismatch: {A.shape} vs {B.shape}"
+
+    if not A.flags.c_contiguous:
+        base = gpuarray.GPUArray((Ka, M), np.float32, gpudata=A.gpudata)
+        A = transpose_2d(base, name="matmul_T_a")
+    if not B.flags.c_contiguous:
+        base = gpuarray.GPUArray((N, Ka), np.float32, gpudata=B.gpudata)
+        B = transpose_2d(base, name="matmul_T_b")
+
+    C = gpuarray.empty((M, N), dtype=np.float32)
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
+
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, Ka), (Kb, N), (M, N), grid_dim, block_dim)
+
+    _gemm_kernel(A, B, C, np.int32(M), np.int32(N), np.int32(Ka), block=block_dim, grid=grid_dim)
+    return C
+
+
+def transpose_2d(x: gpuarray.GPUArray, name: str = "transpose_2d") -> gpuarray.GPUArray:
+    """Return contiguous transpose of a C-contiguous 2D array (pooled scratch)."""
+    assert x.ndim == 2 and x.flags.c_contiguous
+    rows, cols = int(x.shape[0]), int(x.shape[1])
+    out = scratch_pool.get((cols, rows), name=name)
+    n = rows * cols
+    grid, block = _launch_1d(n)
+    _transpose_2d_kernel(x, out, np.int32(rows), np.int32(cols), block=block, grid=grid)
+    return out
+
+
+def matmul_bias(
+    A: gpuarray.GPUArray, B: gpuarray.GPUArray, bias: gpuarray.GPUArray,
+    tracer=None, name: str = "gemm_bias",
+) -> gpuarray.GPUArray:
+    """C = A @ B + bias (contiguous A, B only)."""
+    from tools.tracing.runtime_metrics import kernel_timeline
+
+    assert A.flags.c_contiguous and B.flags.c_contiguous
+    M, K = int(A.shape[0]), int(A.shape[1])
+    assert B.shape[0] == K and int(bias.size) == int(B.shape[1])
+    N = int(B.shape[1])
+    C = gpuarray.empty((M, N), dtype=np.float32)
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, K), (K, N), (M, N), grid_dim, block_dim)
+    with kernel_timeline.measure(name, category="gemm"):
+        _gemm_bias_kernel(
+            A, B, bias, C, np.int32(M), np.int32(N), np.int32(K),
+            block=block_dim, grid=grid_dim,
+        )
+    return C
+
+
+def causal_self_attention(
+    q: gpuarray.GPUArray,
+    k: gpuarray.GPUArray,
+    v: gpuarray.GPUArray,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    scale: float,
+) -> tuple:
+    """Causal MHA on interleaved Q/K/V [B*T, C]. Returns (attn_concat, probs)."""
+    from tools.tracing.runtime_metrics import kernel_timeline
+
+    B, T, H, hd = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    C = H * hd
+    # Cache-owned buffers stay on gpuarray.empty (not freelist) so FP16 storage
+    # / backward can replace them safely. LifetimeAllocator is for true temps.
+    out = gpuarray.empty((B * T, C), dtype=np.float32)
+    probs = gpuarray.empty((B * H * T * T,), dtype=np.float32)
+
+    num_warps = (hd + 31) // 32
+    shared_bytes = (2 * T + hd + num_warps) * np.dtype(np.float32).itemsize
+    grid = (T, H, B)
+    block = (int(hd), 1, 1)
+
+    with kernel_timeline.measure("causal_mha", category="attention"):
+        _causal_mha_kernel(
+            q, k, v, out, probs,
+            np.int32(B), np.int32(T), np.int32(H), np.int32(hd), np.float32(scale),
+            block=block, grid=grid, shared=shared_bytes,
+        )
+    return out, probs
+
+
+def linear_qkv_split(
+    A: gpuarray.GPUArray, W_qkv: gpuarray.GPUArray, bias: gpuarray.GPUArray,
+    tracer=None, name: str = "qkv_split",
+) -> tuple:
+    """Fused Q/K/V projection: (A @ W_qkv + bias) split directly into Q,K,V.
+
+    A is [M, K], W_qkv/bias are sized for N = 3*C_head columns. Returns three
+    contiguous [M, C_head] device arrays without materializing the combined
+    [M, 3*C_head] buffer (one launch instead of gemm_bias + split_qkv).
+    """
+    assert A.flags.c_contiguous and W_qkv.flags.c_contiguous
+    M, K = int(A.shape[0]), int(A.shape[1])
+    N = int(W_qkv.shape[1])
+    assert W_qkv.shape[0] == K and int(bias.size) == N
+    assert N % 3 == 0, f"gemm_bias_qkv_split expects N = 3*C_head, got {N}"
+    C_head = N // 3
+
+    from model.cuda.allocator import lifetime_allocator
+    Q = lifetime_allocator.empty((M, C_head), dtype=np.float32, lifetime="qkv_split")
+    K_out = lifetime_allocator.empty((M, C_head), dtype=np.float32, lifetime="qkv_split")
+    V = lifetime_allocator.empty((M, C_head), dtype=np.float32, lifetime="qkv_split")
+
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, K), (K, N), (M, C_head), grid_dim, block_dim)
+
+    _gemm_bias_qkv_split_kernel(
+        A, W_qkv, bias, Q, K_out, V,
+        np.int32(M), np.int32(N), np.int32(K), np.int32(C_head),
+        block=block_dim, grid=grid_dim,
+    )
+    return Q, K_out, V
+
+
+def reduce_sum_axis0(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Sum over axis 0 of a 2D [rows, channels] array. Returns [channels]."""
+    assert x.ndim == 2 and x.flags.c_contiguous
+    rows, channels = int(x.shape[0]), int(x.shape[1])
+    # Fresh buffer: result is often stored in the grad dict across layers.
+    out = gpuarray.empty((channels,), dtype=np.float32)
+    threads = next_pow2(min(rows, 256))
+    shared = threads * np.dtype(np.float32).itemsize
+    _reduce_sum_axis0_kernel(
+        x, out, np.int32(rows), np.int32(channels),
+        block=(threads, 1, 1), grid=(channels, 1, 1), shared=shared,
+    )
+    return out
+
+
+def linear_backward(
+    dout: gpuarray.GPUArray,
+    x: gpuarray.GPUArray,
+    weight: gpuarray.GPUArray,
+) -> tuple:
+    """Backward for y = x @ weight + b. weight is [in, out]. Returns (d_x, d_weight, d_bias)."""
+    d_weight = matmul(x.T, dout)
+    d_bias = reduce_sum_axis0(dout)
+    d_x = matmul(dout, weight.T)
+    return d_x, d_weight, d_bias
+
+
+def add_bias(a: gpuarray.GPUArray, bias: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """out = a + bias, broadcasting bias over the leading dimension(s) of `a`."""
+    n_elements = np.int32(a.size)
+    bias_len = np.int32(bias.size)
+    out = gpuarray.empty_like(a)
+
+    threads = 256
+    blocks = int(np.ceil(int(n_elements) / threads))
+    _add_bias_kernel(a, bias, out, n_elements, bias_len, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return out
+
+
+def layernorm(x: gpuarray.GPUArray, gamma: gpuarray.GPUArray, beta: gpuarray.GPUArray, eps: float = 1e-5) -> gpuarray.GPUArray:
+    """Layernorm over the last dimension. `x` is treated as [total_rows, hidden_dim]."""
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+
+    out = gpuarray.empty_like(x)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+
+    _layernorm_kernel(
+        x, out, gamma, beta, np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return out
+
+
+def gelu(x: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Elementwise GeLU (tanh approximation)."""
+    n_elements = np.int32(x.size)
+    out = gpuarray.empty_like(x)
+
+    threads = 256
+    blocks = int(np.ceil(int(n_elements) / threads))
+    _gelu_kernel(x, out, n_elements, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return out
+
+
+def matmul_bias_gelu(
+    A: gpuarray.GPUArray, B: gpuarray.GPUArray, bias: gpuarray.GPUArray,
+    tracer=None, name: str = "gemm_bias_gelu",
+) -> tuple:
+    """Fused expand-linear + GELU: returns (hidden, act) where hidden = A@B+bias
+    (pre-activation, needed by gelu_backward) and act = gelu(hidden).
+
+    Saves the standalone gelu_fp32 launch + one re-read of hidden vs. calling
+    matmul_bias() then gelu() separately.
+    """
+    assert A.flags.c_contiguous and B.flags.c_contiguous
+    M, K = int(A.shape[0]), int(A.shape[1])
+    assert B.shape[0] == K and int(bias.size) == int(B.shape[1])
+    N = int(B.shape[1])
+    hidden = gpuarray.empty((M, N), dtype=np.float32)
+    act = gpuarray.empty((M, N), dtype=np.float32)
+    block_dim = (TILE_SIZE, TILE_SIZE, 1)
+    grid_dim = (
+        (N + TILE_SIZE - 1) // TILE_SIZE,
+        (M + TILE_SIZE - 1) // TILE_SIZE,
+        1,
+    )
+    if tracer is not None and getattr(tracer, "trace_vectorization", False):
+        tracer.log_vectorization(name, (M, K), (K, N), (M, N), grid_dim, block_dim)
+    _gemm_bias_gelu_kernel(
+        A, B, bias, hidden, act, np.int32(M), np.int32(N), np.int32(K),
+        block=block_dim, grid=grid_dim,
+    )
+    return hidden, act
+
+
+# Row-fused MLP (single kernel, no global hidden buffer) is correct but only a
+# win if per-row GEMV beats two tiled GEMMs + matmul_bias_gelu at the model's
+# actual dims -- benchmark before flipping. Default off; matmul_bias_gelu (2a)
+# ships regardless of this flag's outcome.
+_USE_FUSED_MLP_ROW_KERNEL = False
+
+
+def fused_mlp_row(
+    x: gpuarray.GPUArray, w1: gpuarray.GPUArray, b1: gpuarray.GPUArray,
+    w2: gpuarray.GPUArray, b2: gpuarray.GPUArray,
+) -> gpuarray.GPUArray:
+    """out = GELU(x @ w1 + b1) @ w2 + b2, one kernel, one block per row.
+
+    x is [M, C], w1 is [C, Hd], w2 is [Hd, C]. Keeps the whole hidden row in
+    shared memory instead of round-tripping it through global memory.
+    """
+    assert x.flags.c_contiguous and w1.flags.c_contiguous and w2.flags.c_contiguous
+    M, C = int(x.shape[0]), int(x.shape[1])
+    Hd = int(w1.shape[1])
+    assert w1.shape[0] == C and w2.shape == (Hd, C) and int(b1.size) == Hd and int(b2.size) == C
+    out = gpuarray.empty((M, C), dtype=np.float32)
+    threads = next_pow2(min(max(C, Hd), 256))
+    shared_bytes = (C + Hd) * np.dtype(np.float32).itemsize
+    _fused_mlp_row_kernel(
+        x, w1, b1, w2, b2, out, np.int32(C), np.int32(Hd),
+        block=(threads, 1, 1), grid=(M, 1, 1), shared=shared_bytes,
+    )
+    return out
+
+
+def softmax(logits: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Softmax over the last dimension. `logits` is treated as [total_rows, vocab_size]."""
+    vocab_size = int(logits.shape[-1])
+    total_rows = int(np.prod(logits.shape[:-1])) if logits.ndim > 1 else 1
+
+    probs = gpuarray.empty_like(logits)
+    threads = next_pow2(vocab_size)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+
+    _softmax_kernel(
+        logits, probs, np.int32(vocab_size), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return probs
+
+
+def split_qkv(qkv: gpuarray.GPUArray, hidden_dim: int):
+    """Split [rows, 3*C] qkv into contiguous Q,K,V [rows, C] on device."""
+    rows = int(qkv.shape[0])
+    c = int(hidden_dim)
+    n = rows * c
+    q = gpuarray.empty((rows, c), dtype=np.float32)
+    k = gpuarray.empty((rows, c), dtype=np.float32)
+    v = gpuarray.empty((rows, c), dtype=np.float32)
+    threads = 256
+    blocks = int(np.ceil(n / threads))
+    _split_qkv_kernel(qkv, q, k, v, np.int32(rows), np.int32(c), block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return q, k, v
+
+
+# Phase 2C fused forward is correct but ~2x slower than causal_mha on sm_35 at T=256.
+# Default uses corrected causal_mha; set True to force the GPU5 fused kernel.
+_USE_FUSED_ATTENTION_FORWARD = False
+
+
+def split_heads_from_qkv(
+    qkv: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+) -> tuple:
+    """QKV [B*T, 3*C] -> Q,K,V each [B*NH, T, HD]."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    q = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    k = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    v = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _split_heads_kernel(
+        qkv, q, k, v, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return q, k, v
+
+
+def pack_qkv_from_heads(
+    d_q: gpuarray.GPUArray, d_k: gpuarray.GPUArray, d_v: gpuarray.GPUArray,
+    batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+) -> gpuarray.GPUArray:
+    """Pack dQ/dK/dV [B*NH, T, HD] into dQKV [B*T, 3*C] (fresh buffer)."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    out = gpuarray.empty((B * T, 3 * NH * HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _merge_heads_qkv_kernel(
+        d_q, d_k, d_v, out, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return out
+
+
+def fused_causal_attention_from_qkv(
+    ln1_out_d: gpuarray.GPUArray,
+    w_qkv: gpuarray.GPUArray,
+    bias_qkv: gpuarray.GPUArray,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    scale: float,
+    tracer=None,
+    name: str = "qkv",
+    rope_base: float = None,
+    pos_offset: int = 0,
+) -> tuple:
+    """QKV projection (fused with the split) + causal attention.
+
+    ``ln1_out_d`` is [B*T, K]; ``w_qkv``/``bias_qkv`` project to N = 3*C.
+    Returns (attn_concat [B*T, C], probs flat, q_h, k_h, v_h) with heads
+    in [B*NH, T, HD] for the backward path (avoids re-split).
+
+    When ``rope_base`` is set, applies RoPE to Q/K (heads layout) before attention.
+    """
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    C = NH * HD
+    H = B * NH
+    M, D = T, HD
+    use_rope = rope_base is not None
+
+    q, k, v = linear_qkv_split(ln1_out_d, w_qkv, bias_qkv, tracer=tracer, name=name)
+
+    if _USE_FUSED_ATTENTION_FORWARD or use_rope:
+        q_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+        k_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+        v_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+        n = B * T * NH * HD
+        grid, block = _launch_1d(n)
+        _interleaved_to_heads_kernel(
+            q, q_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+            block=block, grid=grid,
+        )
+        _interleaved_to_heads_kernel(
+            k, k_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+            block=block, grid=grid,
+        )
+        _interleaved_to_heads_kernel(
+            v, v_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+            block=block, grid=grid,
+        )
+        from model.cuda.allocator import lifetime_allocator
+        lifetime_allocator.release(q)
+        lifetime_allocator.release(k)
+        lifetime_allocator.release(v)
+        if use_rope:
+            rope_apply_inplace(
+                q_h, batch_heads=H, seq_len=T, head_dim=HD,
+                base=float(rope_base), pos_offset=int(pos_offset),
+            )
+            rope_apply_inplace(
+                k_h, batch_heads=H, seq_len=T, head_dim=HD,
+                base=float(rope_base), pos_offset=int(pos_offset),
+            )
+        probs = gpuarray.empty((H, M, M), dtype=np.float32)
+        out_h = gpuarray.empty((H, M, D), dtype=np.float32)
+        row_max = scratch_pool.get((H, M), name="fused_row_max")
+        row_sum = scratch_pool.get((H, M), name="fused_row_sum")
+        threads = next_pow2(max(D, min(M, 256)))
+        shared_bytes = (D + M + threads) * np.dtype(np.float32).itemsize
+        _fused_attn_fwd_kernel(
+            q_h, k_h, v_h, probs, out_h, row_max, row_sum,
+            np.int32(H), np.int32(M), np.int32(D), np.float32(scale),
+            block=(threads, 1, 1), grid=(H, M, 1), shared=shared_bytes,
+        )
+        attn_concat = merge_heads(out_h, B, T, NH, HD)
+        return attn_concat, probs.reshape(H * M * M), q_h, k_h, v_h
+
+    attn_concat, probs = causal_self_attention(q, k, v, B, T, NH, HD, scale)
+    q_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    k_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    v_h = gpuarray.empty((B * NH, T, HD), dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _interleaved_to_heads_kernel(
+        q, q_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    _interleaved_to_heads_kernel(
+        k, k_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    _interleaved_to_heads_kernel(
+        v, v_h, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    from model.cuda.allocator import lifetime_allocator
+    lifetime_allocator.release(q)
+    lifetime_allocator.release(k)
+    lifetime_allocator.release(v)
+    return attn_concat, probs, q_h, k_h, v_h
+
+
+def softmax_backward(
+    probs: gpuarray.GPUArray,
+    d_probs: gpuarray.GPUArray,
+    scale: float = 1.0,
+) -> gpuarray.GPUArray:
+    """Softmax backward for attention matrices [rows, T]. Returns d_scores on device."""
+    assert probs.shape == d_probs.shape
+    T = int(probs.shape[-1])
+    total_rows = int(np.prod(probs.shape[:-1])) if probs.ndim > 1 else 1
+    d_scores = gpuarray.empty_like(probs)
+    threads = next_pow2(T)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _softmax_backward_kernel(
+        probs, d_probs, d_scores,
+        np.int32(T), np.int32(total_rows), np.float32(scale),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return d_scores
+
+
+def interleaved_to_heads(
+    x: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+    name: str = "interleaved_to_heads",
+) -> gpuarray.GPUArray:
+    """[B*T, NH*HD] -> [B*NH, T, HD] contiguous."""
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    out = scratch_pool.get((B * NH, T, HD), name=name)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _interleaved_to_heads_kernel(
+        x, out, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return out
+
+
+def merge_heads(
+    heads: gpuarray.GPUArray, batch_size: int, seq_len: int, num_heads: int, head_dim: int,
+    name: str = None,
+) -> gpuarray.GPUArray:
+    """[B*NH, T, HD] -> [B*T, NH*HD].
+
+    If ``name`` is set, use the scratch pool; otherwise allocate a fresh buffer
+    (required when the result is returned to callers / caches).
+    """
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    shape = (B * T, NH * HD)
+    out = scratch_pool.get(shape, name=name) if name else gpuarray.empty(shape, dtype=np.float32)
+    n = B * T * NH * HD
+    grid, block = _launch_1d(n)
+    _merge_heads_kernel(
+        heads, out, np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+        block=block, grid=grid,
+    )
+    return out
+
+
+def pack_qkv(q: gpuarray.GPUArray, k: gpuarray.GPUArray, v: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """Pack [rows, C] Q/K/V into [rows, 3*C] (fresh buffer — often fed to linear_backward)."""
+    rows, c = int(q.shape[0]), int(q.shape[1])
+    out = gpuarray.empty((rows, 3 * c), dtype=np.float32)
+    n = rows * c
+    grid, block = _launch_1d(n)
+    _pack_qkv_kernel(q, k, v, out, np.int32(rows), np.int32(c), block=block, grid=grid)
+    return out
+
+
+def attention_backward_heads(
+    d_attn_concat: gpuarray.GPUArray,
+    q: gpuarray.GPUArray,
+    k: gpuarray.GPUArray,
+    v: gpuarray.GPUArray,
+    probs: gpuarray.GPUArray,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    scale: float,
+    heads_layout: bool = False,
+) -> tuple:
+    """Attention backward over all heads in a few batched launches.
+
+    If ``heads_layout`` is True, q/k/v are [B*NH, T, HD]; else [B*T, C].
+    d_attn_concat is always [B*T, C].
+    Returns (d_q, d_k, d_v) in the same layout as q/k/v.
+    """
+    B, T, NH, HD = int(batch_size), int(seq_len), int(num_heads), int(head_dim)
+    H = B * NH
+    M, D = T, HD
+
+    if heads_layout:
+        q_h, k_h, v_h = q, k, v
+    else:
+        q_h = interleaved_to_heads(q, B, T, NH, HD, name="attn_bwd_q")
+        k_h = interleaved_to_heads(k, B, T, NH, HD, name="attn_bwd_k")
+        v_h = interleaved_to_heads(v, B, T, NH, HD, name="attn_bwd_v")
+    d_out_h = interleaved_to_heads(d_attn_concat, B, T, NH, HD, name="attn_bwd_dout")
+    probs_h = probs.reshape(H, M, M)
+
+    d_probs = scratch_pool.get((H, M, M), name="attn_d_probs")
+    d_raw = scratch_pool.get((H, M, M), name="attn_d_raw")
+    row_sum = scratch_pool.get((H, M), name="attn_row_sum")
+    d_q_h = scratch_pool.get((H, M, D), name="attn_d_q")
+    d_k_h = scratch_pool.get((H, M, D), name="attn_d_k")
+    d_v_h = scratch_pool.get((H, M, D), name="attn_d_v")
+
+    _gemm_batched_kernel(
+        probs_h, d_out_h, d_v_h,
+        np.int32(M), np.int32(D), np.int32(M), np.int32(H),
+        np.int32(1), np.int32(0),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(D / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
+    )
+    _gemm_batched_kernel(
+        d_out_h, v_h, d_probs,
+        np.int32(M), np.int32(M), np.int32(D), np.int32(H),
+        np.int32(0), np.int32(1),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(M / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
+    )
+
+    sm_threads = next_pow2(min(M, 256))
+    sm_shared = sm_threads * np.dtype(np.float32).itemsize
+    _softmax_fused_backward_kernel(
+        d_probs, probs_h, row_sum, d_raw,
+        np.int32(H), np.int32(M), np.float32(scale),
+        block=(sm_threads, 1, 1), grid=(H, M, 1), shared=sm_shared,
+    )
+
+    _gemm_batched_kernel(
+        d_raw, k_h, d_q_h,
+        np.int32(M), np.int32(D), np.int32(M), np.int32(H),
+        np.int32(0), np.int32(0),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(D / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
+    )
+    _gemm_batched_kernel(
+        d_raw, q_h, d_k_h,
+        np.int32(M), np.int32(D), np.int32(M), np.int32(H),
+        np.int32(1), np.int32(0),
+        block=(TILE_SIZE, TILE_SIZE, 1),
+        grid=(int(np.ceil(D / TILE_SIZE)), int(np.ceil(M / TILE_SIZE)), H),
+    )
+
+    if heads_layout:
+        # Safe: caller must pack into a fresh buffer before the next attn-bwd pool reuse.
+        return d_q_h, d_k_h, d_v_h
+    return (
+        merge_heads(d_q_h, B, T, NH, HD),
+        merge_heads(d_k_h, B, T, NH, HD),
+        merge_heads(d_v_h, B, T, NH, HD),
+    )
+
+
+def add_block(
+    acc: gpuarray.GPUArray,
+    block: gpuarray.GPUArray,
+    row0: int,
+    col_start: int,
+    C: int,
+    hd: int,
+) -> None:
+    """Accumulate [block_rows, hd] block into acc[row0:row0+block_rows, col_start:col_start+hd]."""
+    block_rows = int(block.shape[0])
+    n = block_rows * hd
+    threads = 256
+    blocks = int(np.ceil(n / threads))
+    _add_block_kernel(
+        acc, block, np.int32(row0), np.int32(C), np.int32(col_start), np.int32(hd), np.int32(block_rows),
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+
+
+def add_inplace(acc: gpuarray.GPUArray, block: gpuarray.GPUArray) -> None:
+    """acc += block elementwise (same shape)."""
+    assert acc.shape == block.shape
+    n = np.int32(acc.size)
+    threads = 256
+    blocks = int(np.ceil(int(n) / threads))
+    _add_inplace_kernel(acc, block, n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+
+
+def grad_global_norm_sq(grads) -> float:
+    """Sum of squares of all gradient tensors on device (single scalar D2H)."""
+    buf = scratch_pool.get((1,), zero=True, name="grad_norm_sq")
+    threads = 256
+    for g in grads.values():
+        n = np.int32(g.size)
+        blocks = int(np.ceil(int(n) / threads))
+        _grad_norm_contrib_kernel(g, buf, n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return float(buf.get()[0])
+
+
+def layernorm_with_cache(
+    x: gpuarray.GPUArray, gamma: gpuarray.GPUArray, beta: gpuarray.GPUArray, eps: float = 1e-5,
+) -> tuple:
+    """Layernorm on device; returns (y, xhat, invstd_row) all on GPU.
+
+    Outputs are cached for backward across layers — not pooled.
+    """
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invstd_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _layernorm_cache_kernel(
+        x, y, xhat, invstd_row, gamma, beta,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return y, xhat, invstd_row
+
+
+def rmsnorm_with_cache(
+    x: gpuarray.GPUArray, gamma: gpuarray.GPUArray, eps: float = 1e-5,
+) -> tuple:
+    """RMSNorm on device; returns (y, xhat, invrms_row). Scale-only (no beta)."""
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invrms_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _rmsnorm_cache_kernel(
+        x, y, xhat, invrms_row, gamma,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return y, xhat, invrms_row
+
+
+def residual_layernorm_with_cache(
+    x: gpuarray.GPUArray,
+    residual: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+    beta: gpuarray.GPUArray,
+    eps: float = 1e-5,
+) -> tuple:
+    """Fused x_out = x + residual; y = LN(x_out). Returns (x_out, y, xhat, invstd).
+
+    y/xhat/invstd are cached for backward — not pooled. x_out becomes the residual stream.
+    """
+    assert x.shape == residual.shape
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    x_out = gpuarray.empty_like(x)
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invstd_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _residual_layernorm_cache_kernel(
+        x, residual, x_out, y, xhat, invstd_row, gamma, beta,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return x_out, y, xhat, invstd_row
+
+
+def residual_rmsnorm_with_cache(
+    x: gpuarray.GPUArray,
+    residual: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+    eps: float = 1e-5,
+) -> tuple:
+    """Fused x_out = x + residual; y = RMSNorm(x_out). Returns (x_out, y, xhat, invrms)."""
+    assert x.shape == residual.shape
+    hidden_dim = int(x.shape[-1])
+    total_rows = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    x_out = gpuarray.empty_like(x)
+    y = gpuarray.empty_like(x)
+    xhat = gpuarray.empty_like(x)
+    invrms_row = gpuarray.empty((total_rows,), dtype=np.float32)
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _residual_rmsnorm_cache_kernel(
+        x, residual, x_out, y, xhat, invrms_row, gamma,
+        np.int32(hidden_dim), np.float32(eps), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return x_out, y, xhat, invrms_row
+
+
+def _zeros_gpu(shape, dtype=np.float32) -> gpuarray.GPUArray:
+    """Fresh device zeros via memset (no HtoD). Used for grad outputs that persist."""
+    buf = gpuarray.empty(shape, dtype=dtype)
+    cuda.memset_d8(buf.gpudata, 0, buf.nbytes)
+    return buf
+
+
+def layernorm_backward(
+    dout: gpuarray.GPUArray,
+    xhat: gpuarray.GPUArray,
+    invstd_row: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+) -> tuple:
+    """Backward pass for layernorm_with_cache. Returns (dx, dgamma, dbeta) on device."""
+    hidden_dim = int(xhat.shape[-1])
+    total_rows = int(np.prod(xhat.shape[:-1])) if xhat.ndim > 1 else 1
+    dx = gpuarray.empty_like(xhat)
+    dgamma = _zeros_gpu((hidden_dim,))
+    dbeta = _zeros_gpu((hidden_dim,))
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _layernorm_backward_kernel(
+        dout, xhat, invstd_row, gamma, dx, dgamma, dbeta,
+        np.int32(hidden_dim), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return dx, dgamma, dbeta
+
+
+def rmsnorm_backward(
+    dout: gpuarray.GPUArray,
+    xhat: gpuarray.GPUArray,
+    invrms_row: gpuarray.GPUArray,
+    gamma: gpuarray.GPUArray,
+) -> tuple:
+    """RMSNorm backward. Returns (dx, dgamma) on device (no dbeta)."""
+    hidden_dim = int(xhat.shape[-1])
+    total_rows = int(np.prod(xhat.shape[:-1])) if xhat.ndim > 1 else 1
+    dx = gpuarray.empty_like(xhat)
+    dgamma = _zeros_gpu((hidden_dim,))
+    threads = next_pow2(hidden_dim)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _rmsnorm_backward_kernel(
+        dout, xhat, invrms_row, gamma, dx, dgamma,
+        np.int32(hidden_dim), np.int32(total_rows),
+        block=(threads, 1, 1), grid=(total_rows, 1, 1), shared=shared_bytes,
+    )
+    return dx, dgamma
+
+
+def gelu_backward(x: gpuarray.GPUArray, d_out: gpuarray.GPUArray) -> gpuarray.GPUArray:
+    """GeLU backward on device."""
+    n_elements = np.int32(x.size)
+    d_x = gpuarray.empty_like(x)
+    threads = 256
+    blocks = int(np.ceil(int(n_elements) / threads))
+    _gelu_backward_kernel(x, d_out, d_x, n_elements, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return d_x
+
+
+def cross_entropy(logits: gpuarray.GPUArray, targets: np.ndarray) -> tuple:
+    """Mean cross-entropy on device. logits [rows, V], targets [rows] int.
+
+    Returns (loss float, dlogits [rows, V] on device).
+    """
+    rows, vocab_size = int(logits.shape[0]), int(logits.shape[1])
+    targets_d = gpuarray.to_gpu(np.ascontiguousarray(targets, dtype=np.int32))
+    d_logits = gpuarray.empty_like(logits)
+    loss_buf = scratch_pool.get((1,), zero=True, name="ce_loss_buf")
+    threads = next_pow2(vocab_size)
+    shared_bytes = threads * np.dtype(np.float32).itemsize
+    _cross_entropy_kernel(
+        logits, targets_d, d_logits, loss_buf,
+        np.int32(vocab_size), np.int32(rows),
+        block=(threads, 1, 1), grid=(rows, 1, 1), shared=shared_bytes,
+    )
+    return float(loss_buf.get()[0]) / rows, d_logits
+
+
+def scal_mul(arr: gpuarray.GPUArray, scale: float) -> gpuarray.GPUArray:
+    """Multiply device array by scalar in-place."""
+    n = np.int32(arr.size)
+    threads = 256
+    blocks = int(np.ceil(int(n) / threads))
+    _scal_mul_kernel(arr, np.float32(scale), n, block=(threads, 1, 1), grid=(blocks, 1, 1))
+    return arr
+
+
+def adamw_update(
+    w: gpuarray.GPUArray,
+    g: gpuarray.GPUArray,
+    m: gpuarray.GPUArray,
+    v: gpuarray.GPUArray,
+    lr: float,
+    wd: float,
+    b1: float,
+    b2: float,
+    eps: float,
+    bc1: float,
+    bc2: float,
+) -> None:
+    n = np.int32(w.size)
+    threads = 256
+    blocks = int(np.ceil(int(n) / threads))
+    _adamw_update_kernel(
+        w, g, m, v,
+        np.float32(lr), np.float32(wd), np.float32(b1), np.float32(b2), np.float32(eps),
+        np.float32(bc1), np.float32(bc2), n,
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+
+
+def adamw_update_batched(
+    offsets_d: gpuarray.GPUArray,
+    w_ptrs_d: gpuarray.GPUArray,
+    g_ptrs_d: gpuarray.GPUArray,
+    m_ptrs_d: gpuarray.GPUArray,
+    v_ptrs_d: gpuarray.GPUArray,
+    ntensors: int,
+    total_n: int,
+    lr: float,
+    wd: float,
+    b1: float,
+    b2: float,
+    eps: float,
+    bc1: float,
+    bc2: float,
+) -> None:
+    """One AdamW launch across all params via pointer-array indirection.
+
+    ``offsets_d``/``w_ptrs_d``/``m_ptrs_d``/``v_ptrs_d`` are built once (stable
+    weight/m/v buffers); ``g_ptrs_d`` must be rebuilt each step (fresh grad
+    buffers). See training/gpu_optimizer.py for the pointer-table setup.
+    """
+    threads = 256
+    blocks = min(int(np.ceil(total_n / threads)), 65535)
+    _adamw_update_batched_kernel(
+        offsets_d, np.int32(ntensors), w_ptrs_d, g_ptrs_d, m_ptrs_d, v_ptrs_d,
+        np.float32(lr), np.float32(wd), np.float32(b1), np.float32(b2), np.float32(eps),
+        np.float32(bc1), np.float32(bc2), np.int64(total_n),
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+
+
+def embedding_lookup(ids: np.ndarray, emb: gpuarray.GPUArray, pos_emb: gpuarray.GPUArray, T: int) -> gpuarray.GPUArray:
+    """Build [B*T, C] input embeddings on device from token ids [B, T]."""
+    ids = np.asarray(ids, dtype=np.int32)
+    B = int(ids.shape[0])
+    C = int(emb.shape[1])
+    out = gpuarray.empty((B * T, C), dtype=np.float32)
+    ids_d = gpuarray.to_gpu(np.ascontiguousarray(ids.reshape(-1), dtype=np.int32))
+    n = B * T * C
+    threads = 256
+    blocks = int(np.ceil(n / threads))
+    _embed_forward_kernel(
+        emb, pos_emb, ids_d, out, np.int32(B), np.int32(T), np.int32(C),
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+    return out
+
+
+def embedding_lookup_tokens(ids: np.ndarray, emb: gpuarray.GPUArray, T: int) -> gpuarray.GPUArray:
+    """Token embeddings only [B*T, C] (RoPE path)."""
+    ids = np.asarray(ids, dtype=np.int32)
+    B = int(ids.shape[0])
+    C = int(emb.shape[1])
+    out = gpuarray.empty((B * T, C), dtype=np.float32)
+    ids_d = gpuarray.to_gpu(np.ascontiguousarray(ids.reshape(-1), dtype=np.int32))
+    n = B * T * C
+    threads = 256
+    blocks = int(np.ceil(n / threads))
+    _embed_tokens_kernel(
+        emb, ids_d, out, np.int32(B), np.int32(T), np.int32(C),
+        block=(threads, 1, 1), grid=(blocks, 1, 1),
+    )
+    return out
+
+
+def rope_apply_inplace(
+    x: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    seq_len: int,
+    head_dim: int,
+    base: float = 10000.0,
+    pos_offset: int = 0,
+    backward: bool = False,
+) -> gpuarray.GPUArray:
+    """In-place RoPE on heads tensor [BH, T, HD]. HD must be even."""
+    assert x.ndim == 3 and int(x.shape[2]) == head_dim
+    assert head_dim % 2 == 0, "RoPE requires even head_dim"
+    BH, T, HD = int(batch_heads), int(seq_len), int(head_dim)
+    pairs = BH * T * (HD // 2)
+    grid, block = _launch_1d(pairs)
+    sign = -1.0 if backward else 1.0
+    _rope_apply_kernel(
+        x, np.int32(BH), np.int32(T), np.int32(HD),
+        np.float32(base), np.int32(pos_offset), np.float32(sign),
+        block=block, grid=grid,
+    )
+    return x
+
+
+def embed_backward(
+    ids: np.ndarray, d_h: gpuarray.GPUArray, vocab_size: int, embed_dim: int,
+    *, with_position: bool = True,
+) -> tuple:
+    """Returns (d_token_embedding, d_position_embedding|None) on device."""
+    B, T = ids.shape
+    C = embed_dim
+    d_tok = _zeros_gpu((vocab_size, C))
+    ids_d = gpuarray.to_gpu(np.ascontiguousarray(ids, dtype=np.int32))
+    threads = min(next_pow2(C), MAX_THREADS_PER_BLOCK)
+    _embed_backward_kernel(
+        d_tok, ids_d, d_h, np.int32(B), np.int32(T), np.int32(C),
+        block=(threads, 1, 1), grid=(B, T, 1),
+    )
+    if not with_position:
+        return d_tok, None
+    d_pos = _zeros_gpu((T, C))
+    _pos_embed_backward_kernel(
+        d_pos, d_h, np.int32(B), np.int32(T), np.int32(C),
+        block=(threads, 1, 1), grid=(T, 1, 1),
+    )
+    return d_tok, d_pos
+
+
+def sync_to_host(device_arr: gpuarray.GPUArray, host_arr: np.ndarray) -> None:
+    """Copy device array into existing host buffer in-place (no reallocation)."""
+    from tools.tracing.runtime_metrics import runtime_metrics
+
+    if not runtime_metrics.enabled:
+        host_arr[:] = device_arr.get().reshape(host_arr.shape)
+        return
+    cuda.Context.synchronize()
+    with runtime_metrics.measure("to_host"):
+        host_arr[:] = device_arr.get().reshape(host_arr.shape)
+        cuda.Context.synchronize()
+
+
+def kv_pack_prefill(
+    src: gpuarray.GPUArray,
+    dst: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    seq_len: int,
+    max_len: int,
+    head_dim: int,
+    stream=None,
+) -> None:
+    """Copy [BH, T, hd] into arena [BH, max_len, hd] at slots [0 .. T)."""
+    BH, T, hd = int(batch_heads), int(seq_len), int(head_dim)
+    n = BH * T * hd
+    grid, block = _launch_1d(n)
+    kw = dict(block=block, grid=grid)
+    if stream is not None:
+        kw["stream"] = stream
+    _kv_pack_prefill_kernel(
+        src, dst, np.int32(BH), np.int32(T), np.int32(max_len), np.int32(hd),
+        **kw,
+    )
+
+
+def kv_append_row(
+    src: gpuarray.GPUArray,
+    dst: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    t: int,
+    max_len: int,
+    head_dim: int,
+    stream=None,
+) -> None:
+    """Write [BH, hd] (or [BH, 1, hd]) into arena row ``t``."""
+    BH, hd = int(batch_heads), int(head_dim)
+    n = BH * hd
+    grid, block = _launch_1d(n)
+    kw = dict(block=block, grid=grid)
+    if stream is not None:
+        kw["stream"] = stream
+    _kv_append_row_kernel(
+        src, dst, np.int32(BH), np.int32(t), np.int32(max_len), np.int32(hd),
+        **kw,
+    )
+
+
+def causal_mha_decode(
+    q: gpuarray.GPUArray,
+    k_arena: gpuarray.GPUArray,
+    v_arena: gpuarray.GPUArray,
+    *,
+    batch_heads: int,
+    max_len: int,
+    valid_len: int,
+    head_dim: int,
+    scale: float,
+    out: gpuarray.GPUArray = None,
+    stream=None,
+) -> gpuarray.GPUArray:
+    """Single-query causal MHA over a device KV arena.
+
+    ``q`` is [BH, hd] or [BH, 1, hd]; arenas are [BH, max_len, hd].
+    Returns ``out`` [BH, hd].
+    """
+    from tools.tracing.runtime_metrics import kernel_timeline
+
+    BH, hd = int(batch_heads), int(head_dim)
+    T_valid = int(valid_len)
+    if out is None:
+        out = gpuarray.empty((BH, hd), dtype=np.float32)
+    num_warps = (hd + 31) // 32
+    shared_bytes = (2 * max(T_valid, 1) + hd + num_warps) * np.dtype(np.float32).itemsize
+    kw = dict(block=(int(hd), 1, 1), grid=(BH, 1, 1), shared=shared_bytes)
+    if stream is not None:
+        kw["stream"] = stream
+    with kernel_timeline.measure("causal_mha_decode", category="attention"):
+        _causal_mha_decode_kernel(
+            q, k_arena, v_arena, out,
+            np.int32(BH), np.int32(max_len), np.int32(T_valid), np.int32(hd),
+            np.float32(scale),
+            **kw,
+        )
+    return out
+
+
+def argmax_1d(logits: gpuarray.GPUArray, out_idx: gpuarray.GPUArray = None, stream=None) -> gpuarray.GPUArray:
+    """Device argmax over a 1-D logits vector. Returns int32 device scalar [1]."""
+    n = int(logits.size)
+    if out_idx is None:
+        out_idx = gpuarray.empty((1,), dtype=np.int32)
+    threads = 256 if n >= 256 else next_pow2(max(n, 1))
+    threads = min(threads, 256)
+    kw = dict(block=(threads, 1, 1), grid=(1, 1, 1))
+    if stream is not None:
+        kw["stream"] = stream
+    _argmax_1d_kernel(
+        logits, np.int32(n), out_idx,
+        **kw,
+    )
+    return out_idx
+
+
+def topk_mask_inplace(logits: gpuarray.GPUArray, k: int) -> gpuarray.GPUArray:
+    """Zero (set to -1e30) entries below the k-th largest; in-place on device."""
+    n = int(logits.size)
+    kk = max(1, min(int(k), n))
+    threads = next_pow2(n) if n <= 1024 else 1024
+    shared = n * np.dtype(np.float32).itemsize if n <= 1024 else 1024 * 4
+    if n > 1024:
+        # Fallback: host top-k mask for huge vocab (char LM is << 1024).
+        host = logits.get()
+        kth = np.partition(host, -kk)[-kk]
+        host = host.copy()
+        host[host < kth] = -1e30
+        logits.set(host)
+        return logits
+    _topk_mask_kernel(
+        logits, np.int32(n), np.int32(kk),
+        block=(threads, 1, 1), grid=(1, 1, 1), shared=shared,
+    )
+    return logits
+
+
+def sample_logits_device(
+    logits: gpuarray.GPUArray,
+    *,
+    temperature: float = 1.0,
+    top_k: int = None,
+    out_idx: gpuarray.GPUArray = None,
+) -> gpuarray.GPUArray:
+    """Deterministic device sample: optional top-k mask then argmax (graph-safe).
+
+    Temperature scales logits before argmax (near-greedy when temp → 0).
+    Stochastic top-p / multinomial stay on the host path.
+    """
+    n = int(logits.size)
+    work = scratch_pool.get((n,), name="sample_logits_work")
+    # Copy + scale
+    cuda.memcpy_dtod(work.gpudata, logits.gpudata, logits.nbytes)
+    temp = max(float(temperature), 1e-6)
+    if abs(temp - 1.0) > 1e-8:
+        scal_mul(work, 1.0 / temp)
+    if top_k is not None and int(top_k) > 0:
+        topk_mask_inplace(work, int(top_k))
+    return argmax_1d(work, out_idx=out_idx)
+
+
+def param_global_norm(device_tensors) -> float:
+    """L2 norm over an iterable of device weight/bias arrays (log_every use)."""
+    total_sq = 0.0
+    for arr in device_tensors:
+        if arr is None:
+            continue
+        # Reuse grad_norm kernel path via a one-key dict
+        total_sq += float(grad_global_norm_sq({"_": arr}))
+    return float(np.sqrt(total_sq))

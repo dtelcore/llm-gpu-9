@@ -25,7 +25,7 @@ The 1660 Ti is Turing without Tensor cores, so this release does not switch the 
 
 `model/cuda/env.py` registers the CUDA 13.2 DLL directory, puts `nvcc` and `cl.exe` on `PATH`, and passes `-ccbin` plus the MSVC and SDK include paths into every `SourceModule`. Import `model.cuda.ops` (or call `model.cuda.env.configure()`) before any direct `pycuda` import.
 
-A 5 GB process budget and a 5.5 GB soft guard are enforced in `model/cuda/env.py`. The card has 6 GB. The shared-memory GEMM tile is still 16, carried from the previous card.
+A 5 GB process budget and a 5.5 GB soft guard are enforced in `model/cuda/env.py`. The card has 6 GB; tests lock `PROCESS_BUDGET_BYTES` at that cap. The shared-memory GEMM tile is still 16, carried from the previous card.
 
 ---
 

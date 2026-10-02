@@ -48,7 +48,7 @@ from training.chat_format import (  # noqa: E402
     build_chat_prompt_ids,
     sanitize_assistant_reply,
 )
-from training.checkpoint import load_checkpoint  # noqa: E402
+from training.checkpoint import load_checkpoint as _load  # noqa: E402
 from tools.calc import try_calc  # noqa: E402
 
 TOOL_RE = re.compile(
@@ -189,7 +189,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    from training.checkpoint import load_checkpoint as _load
     gpt_config, params, tokenizer, _, _ = _load(args.checkpoint)
     model = GPTModel(gpt_config, params)
     rng = np.random.default_rng(args.seed)

@@ -13,7 +13,7 @@
     "init_scale": 0.02,
     "residual_scale": true,
     "layer_strategy": "resident",
-    "description": "Biggest-possible 1660 Ti 6GB chat model at T=512. C=768 L=12 H=12 (hd=64), ~86M params, est ~3.2GB of the 5GB process budget with grad checkpointing. BPE-2000 English + chat/tool mix. Fresh weights; never --resume another arch."
+    "description": "Biggest-possible 1660 Ti 6GB chat model at T=512. C=768 L=12 H=12 (hd=64), ~86M params, est ~3.0GB of the 5GB process budget resident (B=1/accum=16, no recompute). BPE-2000 English + chat/tool mix. Fresh weights; never --resume another arch."
   },
   "dataset": {
     "name": "gpu9_max512",
@@ -28,11 +28,11 @@
     "name": "gpu9_max512 36h run",
     "learning_rate": 0.0003,
     "weight_decay": 0.05,
-    "batch_size": 2,
+    "batch_size": 1,
     "num_epochs": 1,
     "warmup_steps": 1000,
     "gradient_clip": 1.0,
-    "gradient_accumulation_steps": 8,
+    "gradient_accumulation_steps": 16,
     "window_stride": 256,
     "min_lr_ratio": 0.05,
     "optimizer": "adamw",
@@ -42,6 +42,6 @@
   },
   "metadata": {
     "created": "gpu9-max512",
-    "description": "36h budget ~= 9400 optimizer steps x 8192 tokens (B=2, accum=8, T=512) ~= 77M tokens. Pass --steps 9400 as the cosine length. Stride 256 halves window overlap so limited steps see more unique text. Probe with tools/n50_probe.py; chat with interactive.py --chat or tools/assistant_tools.py."
+    "description": "36h budget ~= 9000 optimizer steps x 8192 tokens (B=1, accum=16, T=512) ~= 74M tokens. Smoke measured ~12.5s/step, so 9000 steps is ~31h. Pass --steps 9000 as the cosine length. Stride 256 halves window overlap so limited steps see more unique text. Probe with tools/n50_probe.py; chat with interactive.py --chat or tools/assistant_tools.py."
   }
 }
